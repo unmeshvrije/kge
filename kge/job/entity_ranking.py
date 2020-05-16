@@ -3,7 +3,7 @@ import time
 
 import torch
 import kge.job
-from kge.job import EvaluationJob, Job
+from kge.job import EvaluationJob, Job, TrainingJob
 from kge import Config, Dataset
 from collections import defaultdict
 
@@ -88,15 +88,11 @@ class EntityRankingJob(EvaluationJob):
         num_entities = self.dataset.num_entities()
 
         # we also filter with test data if requested
-        filter_with_test = (
-            "test" not in self.filter_splits and self.filter_with_test
-        )
+        filter_with_test = "test" not in self.filter_splits and self.filter_with_test
 
         # which rankings to compute (DO NOT REORDER; code assumes the order given here)
         rankings = (
-            ["_raw", "_filt", "_filt_test"]
-            if filter_with_test
-            else ["_raw", "_filt"]
+            ["_raw", "_filt", "_filt_test"] if filter_with_test else ["_raw", "_filt"]
         )
 
         # dictionary that maps entry of rankings to a sparse tensor containing the
@@ -327,7 +323,7 @@ class EntityRankingJob(EvaluationJob):
                     type="entity_ranking",
                     scope="batch",
                     split=self.eval_split,
-                    filter_splits = self.filter_splits,
+                    filter_splits=self.filter_splits,
                     epoch=self.epoch,
                     batch=batch_number,
                     size=len(batch),
@@ -389,6 +385,18 @@ class EntityRankingJob(EvaluationJob):
                     )
                 )
         epoch_time += time.time()
+
+        if isinstance(self.parent_job, TrainingJob):
+            self.parent_job: TrainingJob = self.parent_job
+            train_trace_entry = self.parent_job.run_epoch(
+                split=self.eval_split, echo_trace=False, do_backward=False
+            )
+            metrics.update(
+                avg_loss=train_trace_entry["avg_loss"],
+                avg_penalty=train_trace_entry["avg_penalty"],
+                avg_penalties=train_trace_entry["avg_penalties"],
+                avg_cost=train_trace_entry["avg_cost"],
+            )
 
         # compute trace
         trace_entry = dict(
