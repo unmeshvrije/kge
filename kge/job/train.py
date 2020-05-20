@@ -52,24 +52,26 @@ class TrainingJob(Job):
         self.batch_size: int = config.get("train.batch_size")
         self.device: str = self.config.get("job.device")
         self.train_split = config.get("train.split")
-        valid_conf = config.clone()
-        valid_conf.set("job.type", "eval")
-        if self.config.get("valid.split") != "":
-            valid_conf.set("eval.split", self.config.get("valid.split"))
-        valid_conf.set("eval.trace_level", self.config.get("valid.trace_level"))
-        self.valid_job = EvaluationJob.create(
-            valid_conf, dataset, parent_job=self, model=self.model
-        )
         self.config.check("train.trace_level", ["batch", "epoch"])
         self.trace_batch: bool = self.config.get("train.trace_level") == "batch"
         self.epoch: int = 0
-        self.valid_trace: List[Dict[str, Any]] = []
-        self.is_prepared: Dict[str, bool] = defaultdict(lambda: False)
+        self.is_prepared = False
         self.model.train()
 
+        if config.get("job.type") == "train":
+            valid_conf = config.clone()
+            valid_conf.set("job.type", "eval")
+            if self.config.get("valid.split") != "":
+                valid_conf.set("eval.split", self.config.get("valid.split"))
+            valid_conf.set("eval.trace_level", self.config.get("valid.trace_level"))
+            self.valid_job = EvaluationJob.create(
+                valid_conf, dataset, parent_job=self, model=self.model
+            )
+            self.valid_trace: List[Dict[str, Any]] = []
+
         # attributes filled in by implementing classes
-        self.loader: Dict[str, DataLoader] = dict()
-        self.num_examples: Dict[str, int] = dict()
+        self.loader = None
+        self.num_examples = None
         self.type_str: Optional[str] = None
 
         #: Hooks run after training for an epoch.
@@ -167,9 +169,7 @@ class TrainingJob(Job):
             # start a new epoch
             self.epoch += 1
             self.config.log("Starting epoch {}...".format(self.epoch))
-            trace_entry = self.run_epoch(
-                split=self.train_split, echo_trace=True, do_backward=True
-            )
+            trace_entry = self.run_epoch(echo_trace=True, forward_only=True)
             for f in self.post_epoch_hooks:
                 f(self, trace_entry)
             self.config.log("Finished epoch {}.".format(self.epoch))
@@ -290,16 +290,14 @@ class TrainingJob(Job):
         else:
             self.config.log("No checkpoint found, starting from scratch...")
 
-    def run_epoch(
-        self, split: str, echo_trace: bool, do_backward: bool
-    ) -> Dict[str, Any]:
+    def run_epoch(self, echo_trace: bool, forward_only: bool) -> Dict[str, Any]:
         "Runs an epoch and returns a trace entry."
 
         # prepare the job is not done already
-        if not self.is_prepared[split]:
-            self._prepare(split=split)
+        if not self.is_prepared:
+            self._prepare()
             self.model.prepare_job(self)  # let the model add some hooks
-            self.is_prepared[split] = True
+            self.is_prepared = True
 
         # variables that record various statitics
         sum_loss = 0.0
@@ -312,14 +310,14 @@ class TrainingJob(Job):
         optimizer_time = 0.0
 
         # process each batch
-        for batch_index, batch in enumerate(self.loader[split]):
+        for batch_index, batch in enumerate(self.loader):
             for f in self.pre_batch_hooks:
                 f(self)
 
             # process batch (preprocessing + forward pass + backward pass on loss)
             self.optimizer.zero_grad()
             batch_result: TrainingJob._ProcessBatchResult = self._process_batch(
-                batch_index, batch, do_backward
+                batch_index, batch, forward_only
             )
             sum_loss += batch_result.avg_loss * batch_result.size
 
@@ -328,7 +326,7 @@ class TrainingJob(Job):
             penalties_torch = self.model.penalty(
                 epoch=self.epoch,
                 batch_index=batch_index,
-                num_batches=len(self.loader[split]),
+                num_batches=len(self.loader),
                 batch=batch,
             )
             batch_forward_time += time.time()
@@ -337,7 +335,7 @@ class TrainingJob(Job):
             batch_backward_time = batch_result.backward_time - time.time()
             penalty = 0.0
             for index, (penalty_key, penalty_value_torch) in enumerate(penalties_torch):
-                if do_backward:
+                if forward_only:
                     penalty_value_torch.backward()
                 penalty += penalty_value_torch.item()
                 sum_penalties[penalty_key] += penalty_value_torch.item()
@@ -379,7 +377,7 @@ class TrainingJob(Job):
 
             # update parameters
             batch_optimizer_time = 0
-            if do_backward:
+            if forward_only:
                 batch_optimizer_time = -time.time()
                 self.optimizer.step()
                 batch_optimizer_time += time.time()
@@ -390,10 +388,10 @@ class TrainingJob(Job):
                     "type": self.type_str,
                     "scope": "batch",
                     "epoch": self.epoch,
-                    "split": split,
+                    "split": self.train_split,
                     "batch": batch_index,
                     "size": batch_result.size,
-                    "batches": len(self.loader[split]),
+                    "batches": len(self.loader),
                     "lr": [group["lr"] for group in self.optimizer.param_groups],
                     "avg_loss": batch_result.avg_loss,
                     "penalties": [p.item() for k, p in penalties_torch],
@@ -412,14 +410,14 @@ class TrainingJob(Job):
                     (
                         "\r"  # go back
                         + "{}  batch{: "
-                        + str(1 + int(math.ceil(math.log10(len(self.loader[split])))))
+                        + str(1 + int(math.ceil(math.log10(len(self.loader)))))
                         + "d}/{}"
                         + ", avg_loss {:.4E}, penalty {:.4E}, cost {:.4E}, time {:6.2f}s"
                         + "\033[K"  # clear to right
                     ).format(
                         self.config.log_prefix,
                         batch_index,
-                        len(self.loader[split]) - 1,
+                        len(self.loader) - 1,
                         batch_result.avg_loss,
                         penalty,
                         cost_value,
@@ -449,15 +447,14 @@ class TrainingJob(Job):
             type=self.type_str,
             scope="epoch",
             epoch=self.epoch,
-            split=split,
-            batches=len(self.loader[split]),
-            size=self.num_examples[split],
+            split=self.train_split,
+            batches=len(self.loader),
+            size=self.num_examples,
             lr=[group["lr"] for group in self.optimizer.param_groups],
-            avg_loss=sum_loss / self.num_examples[split],
-            avg_penalty=sum_penalty / len(self.loader[split]),
-            avg_penalties={k: p / len(self.loader[split]) for k, p in sum_penalties.items()},
-            avg_cost=sum_loss / self.num_examples[split]
-            + sum_penalty / len(self.loader[split]),
+            avg_loss=sum_loss / self.num_examples,
+            avg_penalty=sum_penalty / len(self.loader),
+            avg_penalties={k: p / len(self.loader) for k, p in sum_penalties.items()},
+            avg_cost=sum_loss / self.num_examples + sum_penalty / len(self.loader),
             epoch_time=epoch_time,
             prepare_time=prepare_time,
             forward_time=forward_time,
@@ -473,7 +470,7 @@ class TrainingJob(Job):
         )
         return trace_entry
 
-    def _prepare(self, split: str):
+    def _prepare(self):
         """Prepare this job for running.
 
         Sets (at least) the `loader`, `num_examples`, and `type_str` attributes of this
@@ -496,7 +493,7 @@ class TrainingJob(Job):
         backward_time: float
 
     def _process_batch(
-        self, batch_index: int, batch, do_backward: bool
+        self, batch_index: int, batch, forward_only: bool
     ) -> "TrainingJob._ProcessBatchResult":
         "Run forward and backward pass on batch and return results."
         raise NotImplementedError
@@ -572,7 +569,7 @@ class TrainingJobKvsAll(TrainingJob):
             for f in Job.job_created_hooks:
                 f(self)
 
-    def _prepare(self, split: str):
+    def _prepare(self):
         from kge.indexing import index_KvsAll_to_torch
 
         # determine enabled query types
@@ -583,28 +580,28 @@ class TrainingJobKvsAll(TrainingJob):
         ]
 
         # construct relevant data structures
-        self.num_examples[split] = 0
+        self.num_examples = 0
         for query_type in self.query_types:
             index_type = (
                 "sp_to_o"
                 if query_type == "sp_"
                 else ("so_to_p" if query_type == "s_o" else "po_to_s")
             )
-            index = self.dataset.index(f"{split}_{index_type}")
-            self.num_examples[split] += len(index)
-            self.query_end_index[query_type + split] = self.num_examples[split]
+            index = self.dataset.index(f"{self.train_split}_{index_type}")
+            self.num_examples += len(index)
+            self.query_end_index[query_type] = self.num_examples
 
             # Convert indexes to pytorch tensors (as described above).
             (
-                self.queries[query_type + split],
-                self.labels[query_type + split],
-                self.label_offsets[query_type + split],
+                self.queries[query_type],
+                self.labels[query_type],
+                self.label_offsets[query_type],
             ) = index_KvsAll_to_torch(index)
 
         # create dataloader
-        self.loader[split] = torch.utils.data.DataLoader(
-            range(self.num_examples[split]),
-            collate_fn=self._get_collate_fun(split),
+        self.loader = torch.utils.data.DataLoader(
+            range(self.num_examples),
+            collate_fn=self._get_collate_fun(),
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.config.get("train.num_workers"),
@@ -614,7 +611,7 @@ class TrainingJobKvsAll(TrainingJob):
             pin_memory=self.config.get("train.pin_memory"),
         )
 
-    def _get_collate_fun(self, split: str):
+    def _get_collate_fun(self):
         # create the collate function
         def collate(batch):
             """For a batch of size n, returns a dictionary of:
@@ -633,15 +630,11 @@ class TrainingJobKvsAll(TrainingJob):
             for example_index in batch:
                 start = 0
                 for query_type_index, query_type in enumerate(self.query_types):
-                    end = self.query_end_index[query_type + split]
+                    end = self.query_end_index[query_type]
                     if example_index < end:
                         example_index -= start
-                        num_ones += self.label_offsets[query_type + split][
-                            example_index + 1
-                        ]
-                        num_ones -= self.label_offsets[query_type + split][
-                            example_index
-                        ]
+                        num_ones += self.label_offsets[query_type][example_index + 1]
+                        num_ones -= self.label_offsets[query_type][example_index]
                         break
                     start = end
 
@@ -654,13 +647,13 @@ class TrainingJobKvsAll(TrainingJob):
             for batch_index, example_index in enumerate(batch):
                 start = 0
                 for query_type_index, query_type in enumerate(self.query_types):
-                    end = self.query_end_index[query_type + split]
+                    end = self.query_end_index[query_type]
                     if example_index < end:
                         example_index -= start
                         query_type_indexes_batch[batch_index] = query_type_index
-                        queries = self.queries[query_type + split]
-                        label_offsets = self.label_offsets[query_type + split]
-                        labels = self.labels[query_type + split]
+                        queries = self.queries[query_type]
+                        label_offsets = self.label_offsets[query_type]
+                        labels = self.labels[query_type]
                         if query_type == "sp_":
                             query_col_1, query_col_2, target_col = S, P, O
                         elif query_type == "s_o":
@@ -702,7 +695,7 @@ class TrainingJobKvsAll(TrainingJob):
         return collate
 
     def _process_batch(
-        self, batch_index, batch, do_backward: bool
+        self, batch_index, batch, forward_only: bool
     ) -> TrainingJob._ProcessBatchResult:
         # prepare
         prepare_time = -time.time()
@@ -774,7 +767,7 @@ class TrainingJobKvsAll(TrainingJob):
                 loss_value_total = loss_value.item()
                 forward_time += time.time()
                 backward_time -= time.time()
-                if do_backward:
+                if forward_only:
                     loss_value.backward()
                 backward_time += time.time()
 
@@ -811,13 +804,13 @@ class TrainingJobNegativeSampling(TrainingJob):
             for f in Job.job_created_hooks:
                 f(self)
 
-    def _prepare(self, split: str):
+    def _prepare(self):
         """Construct dataloader"""
 
-        self.num_examples[split] = self.dataset.split(split).size(0)
-        self.loader[split] = torch.utils.data.DataLoader(
-            range(self.num_examples[split]),
-            collate_fn=self._get_collate_fun(split),
+        self.num_examples = self.dataset.split(self.train_split).size(0)
+        self.loader = torch.utils.data.DataLoader(
+            range(self.num_examples),
+            collate_fn=self._get_collate_fun(),
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.config.get("train.num_workers"),
@@ -827,7 +820,7 @@ class TrainingJobNegativeSampling(TrainingJob):
             pin_memory=self.config.get("train.pin_memory"),
         )
 
-    def _get_collate_fun(self, split: str):
+    def _get_collate_fun(self):
         # create the collate function
         def collate(batch):
             """For a batch of size n, returns a tuple of:
@@ -837,7 +830,7 @@ class TrainingJobNegativeSampling(TrainingJob):
               in order S,P,O)
             """
 
-            triples = self.dataset.split(split)[batch, :].long()
+            triples = self.dataset.split(self.train_split)[batch, :].long()
             # labels = torch.zeros((len(batch), self._sampler.num_negatives_total + 1))
             # labels[:, 0] = 1
             # labels = labels.view(-1)
@@ -850,7 +843,7 @@ class TrainingJobNegativeSampling(TrainingJob):
         return collate
 
     def _process_batch(
-        self, batch_index, batch, do_backward: bool
+        self, batch_index, batch, forward_only: bool
     ) -> TrainingJob._ProcessBatchResult:
         # prepare
         prepare_time = -time.time()
@@ -1021,7 +1014,7 @@ class TrainingJobNegativeSampling(TrainingJob):
 
                 # backward pass for this chunk
                 backward_time -= time.time()
-                if do_backward:
+                if forward_only:
                     loss_value_torch.backward()
                 backward_time += time.time()
 
@@ -1043,14 +1036,14 @@ class TrainingJob1vsAll(TrainingJob):
             for f in Job.job_created_hooks:
                 f(self)
 
-    def _prepare(self, split: str):
+    def _prepare(self):
         """Construct dataloader"""
 
-        self.num_examples[split] = self.dataset.split(split).size(0)
-        self.loader[split] = torch.utils.data.DataLoader(
-            range(self.num_examples[split]),
+        self.num_examples = self.dataset.split(self.train_split).size(0)
+        self.loader = torch.utils.data.DataLoader(
+            range(self.num_examples),
             collate_fn=lambda batch: {
-                "triples": self.dataset.split(split)[batch, :].long()
+                "triples": self.dataset.split(self.train_split)[batch, :].long()
             },
             shuffle=True,
             batch_size=self.batch_size,
@@ -1062,7 +1055,7 @@ class TrainingJob1vsAll(TrainingJob):
         )
 
     def _process_batch(
-        self, batch_index, batch, do_backward: bool
+        self, batch_index, batch, forward_only: bool
     ) -> TrainingJob._ProcessBatchResult:
         # prepare
         prepare_time = -time.time()
@@ -1077,7 +1070,7 @@ class TrainingJob1vsAll(TrainingJob):
         loss_value = loss_value_sp.item()
         forward_time += time.time()
         backward_time = -time.time()
-        if do_backward:
+        if forward_only:
             loss_value_sp.backward()
         backward_time += time.time()
 
@@ -1088,7 +1081,7 @@ class TrainingJob1vsAll(TrainingJob):
         loss_value += loss_value_po.item()
         forward_time += time.time()
         backward_time -= time.time()
-        if do_backward:
+        if forward_only:
             loss_value_po.backward()
         backward_time += time.time()
 

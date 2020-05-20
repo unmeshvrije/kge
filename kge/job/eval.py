@@ -1,6 +1,9 @@
-import torch
+import time
 
-from kge.job import Job
+import torch
+from kge import Config, Dataset
+
+from kge.job import Job, TrainingJob
 
 
 class EvaluationJob(Job):
@@ -29,6 +32,12 @@ class EvaluationJob(Job):
             self.filter_splits.append(self.eval_split)
         self.filter_with_test = config.get("eval.filter_with_test")
         self.epoch = -1
+
+        train_job_on_eval_split_config = config.clone()
+        train_job_on_eval_split_config.set("train.split", self.eval_split)
+        self.eval_train_loss_job = TrainingJob.create(
+            config=train_job_on_eval_split_config, parent_job=self, dataset=dataset
+        )
 
         #: Hooks run after training for an epoch.
         #: Signature: job, trace_entry
@@ -96,6 +105,71 @@ class EvaluationJob(Job):
         self.trace(
             event="job_resumed", epoch=self.epoch, checkpoint_file=checkpoint_file
         )
+
+
+class EvalTrainingLossJob(EvaluationJob):
+    """ Entity ranking evaluation protocol """
+
+    def __init__(self, config: Config, dataset: Dataset, parent_job, model):
+        super().__init__(config, dataset, parent_job, model)
+        self.is_prepared = False
+
+        if self.__class__ == EvalTrainingLossJob:
+            for f in Job.job_created_hooks:
+                f(self)
+
+    @torch.no_grad()
+    def run(self) -> dict:
+
+        epoch_time = -time.time()
+
+        was_training = self.model.training
+        self.model.eval()
+        self.config.log(
+            "Evaluating on "
+            + self.eval_split
+            + " data (epoch {})...".format(self.epoch)
+        )
+        epoch_time += time.time()
+
+        train_trace_entry = self.eval_train_loss_job.run_epoch(
+            echo_trace=False, forward_only=False
+        )
+        # compute trace
+        trace_entry = dict(
+            type="eval_train_loss_job",
+            scope="epoch",
+            split=self.eval_split,
+            epoch=self.epoch,
+            epoch_time=epoch_time,
+            event="eval_completed",
+            avg_loss=train_trace_entry["avg_loss"],
+        )
+        for f in self.post_epoch_trace_hooks:
+            f(self, trace_entry)
+
+        # if validation metric is not present, try to compute it
+        metric_name = self.config.get("valid.metric")
+        if metric_name not in trace_entry:
+            trace_entry[metric_name] = eval(
+                self.config.get("valid.metric_expr"),
+                None,
+                dict(config=self.config, **trace_entry),
+            )
+
+        # write out trace
+        trace_entry = self.trace(**trace_entry, echo=True, echo_prefix="  ", log=True)
+
+        # reset model and return metrics
+        if was_training:
+            self.model.train()
+        self.config.log("Finished evaluating train loss on " + self.eval_split + " split.")
+
+        for f in self.post_valid_hooks:
+            f(self, trace_entry)
+
+        return trace_entry
+
 
 
 # HISTOGRAM COMPUTATION ###############################################################
