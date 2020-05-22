@@ -85,6 +85,10 @@ class EvaluationJob(Job):
             return EntityPairRankingJob(
                 config, dataset, parent_job=parent_job, model=model
             )
+        elif config.get("eval.type") == "training_loss":
+            return EvalTrainingLossJob(
+                config, dataset, parent_job=parent_job, model=model
+            )
         else:
             raise ValueError("eval.type")
 
@@ -137,7 +141,7 @@ class EvalTrainingLossJob(EvaluationJob):
         )
         # compute trace
         trace_entry = dict(
-            type="eval_train_loss_job",
+            type="training_loss",
             scope="epoch",
             split=self.eval_split,
             epoch=self.epoch,
@@ -163,13 +167,14 @@ class EvalTrainingLossJob(EvaluationJob):
         # reset model and return metrics
         if was_training:
             self.model.train()
-        self.config.log("Finished evaluating train loss on " + self.eval_split + " split.")
+        self.config.log(
+            "Finished evaluating train loss on " + self.eval_split + " split."
+        )
 
         for f in self.post_valid_hooks:
             f(self, trace_entry)
 
         return trace_entry
-
 
 
 # HISTOGRAM COMPUTATION ###############################################################
