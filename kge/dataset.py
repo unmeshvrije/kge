@@ -1,263 +1,491 @@
 import csv
 import os
-from collections import defaultdict, OrderedDict
+import sys
 
 import torch
+from torch import Tensor
+import numpy as np
+import pickle
+import inspect
 
-from kge.util.misc import kge_base_dir
+from kge import Config, Configurable
+import kge.indexing
+from kge.indexing import create_default_index_functions
+from kge.misc import kge_base_dir
+
+from typing import Dict, List, Any, Callable, Union, Optional
 
 
-# TODO add support to pickle dataset (and indexes) and reload from there
-class Dataset:
-    def __init__(
-        self,
-        config,
-        num_entities,
-        entities,
-        num_relations,
-        relations,
-        train,
-        train_meta,
-        valid,
-        valid_meta,
-        test,
-        test_meta,
-    ):
-        self.config = config
-        self.num_entities = num_entities
-        self.entities = entities  # array: entity index -> metadata array of strings
-        self.num_relations = num_relations
-        self.relations = relations  # array: relation index -> metadata array of strings
-        self.train = train  # (n,3) int32 tensor
-        self.train_meta = (
-            train_meta
-        )  # array: triple row number -> metadata array of strings
-        self.valid = valid  # (n,3) int32 tensor
-        self.valid_meta = (
-            valid_meta
-        )  # array: triple row number -> metadata array of strings
-        self.test = test  # (n,3) int32 tensor
-        self.test_meta = (
-            test_meta
-        )  # array: triple row number -> metadata array of strings
-        self.indexes = {}  # map: name of index -> index (used mainly by training jobs)
+class Dataset(Configurable):
+    """Stores information about a dataset.
+
+    This includes the number of entities, number of relations, splits containing tripels
+    (e.g., to train, validate, test), indexes, and various metadata about these objects.
+    Most of these objects can be lazy-loaded on first use.
+
+    """
+
+    #: whether to about when an outdated cached dataset or index file is found
+    _abort_when_cache_outdated = False
+
+    def __init__(self, config, folder=None):
+        """Constructor for internal use.
+
+        To load a dataset, use `Dataset.load()`."""
+        super().__init__(config, "dataset")
+
+        #: directory in which dataset is stored
+        self.folder = folder
+
+        # read the number of entities and relations from the config, if present
+        try:
+            self._num_entities: Int = config.get("dataset.num_entities")
+            if self._num_entities < 0:
+                self._num_entities = None
+        except KeyError:
+            self._num_entities: Int = None
+
+        try:
+            self._num_relations: Int = config.get("dataset.num_relations")
+            if self._num_relations < 0:
+                self._num_relations = None
+        except KeyError:
+            self._num_relations: Int = None
+
+        #: split-name to (n,3) int32 tensor
+        self._triples: Dict[str, Tensor] = {}
+
+        #: meta data that is part if this dataset. Indexed by key.
+        self._meta: Dict[str, Any] = {}
+
+        #: data derived automatically from the splits or meta data. Indexed by key.
+        self._indexes: Dict[str, Any] = {}
+
+        #: functions that compute and add indexes as needed; arguments are dataset and
+        #: key. Index functions are expected to not recompute an index that is already
+        #: present. Indexed by key (same key as in self._indexes)
+        self.index_functions: Dict[str, Callable] = {}
+        create_default_index_functions(self)
+
+    ## LOADING ##########################################################################
 
     @staticmethod
-    def load(config):
+    def load(config: Config, preload_data=True):
+        """Loads a dataset.
+
+        If preload_data is set, loads entity and relation maps as well as all splits.
+        Otherwise, this data is lazy loaded on first use.
+
+        """
         name = config.get("dataset.name")
-        config.log("Loading dataset " + name + "...")
-        base_dir = os.path.join(kge_base_dir(), "data/" + name)
+        folder = os.path.join(kge_base_dir(), "data", name)
+        if os.path.isfile(os.path.join(folder, "dataset.yaml")):
+            config.log("Loading configuration of dataset " + name + "...")
+            config.load(os.path.join(folder, "dataset.yaml"))
 
-        num_entities, entities = Dataset._load_map(
-            os.path.join(base_dir, config.get("dataset.entity_map"))
-        )
-        num_relations, relations = Dataset._load_map(
-            os.path.join(base_dir, config.get("dataset.relation_map"))
-        )
-
-        train, train_meta = Dataset._load_triples(
-            os.path.join(base_dir, config.get("dataset.train"))
-        )
-
-        valid, valid_meta = Dataset._load_triples(
-            os.path.join(base_dir, config.get("dataset.valid"))
-        )
-
-        test, test_meta = Dataset._load_triples(
-            os.path.join(base_dir, config.get("dataset.test"))
-        )
-
-        result = Dataset(
-            config,
-            num_entities,
-            entities,
-            num_relations,
-            relations,
-            train,
-            train_meta,
-            valid,
-            valid_meta,
-            test,
-            test_meta,
-        )
-
-        config.log(str(num_entities) + " entities", prefix="  ")
-        config.log(str(num_relations) + " relations", prefix="  ")
-        config.log(str(len(train)) + " training triples", prefix="  ")
-        config.log(str(len(valid)) + " validation triples", prefix="  ")
-        config.log(str(len(test)) + " test triples", prefix="  ")
-
-        return result
+        dataset = Dataset(config, folder)
+        if preload_data:
+            dataset.entity_ids()
+            dataset.relation_ids()
+            for split in ["train", "valid", "test"]:
+                dataset.split(split)
+        return dataset
 
     @staticmethod
-    def _load_map(filename):
+    def _to_valid_filename(s):
+        invalid_chars = "\n\t\\/"
+        replacement_chars = "ntbf"
+        trans = invalid_chars.maketrans(invalid_chars, replacement_chars)
+        return s.translate(trans)
+
+    @staticmethod
+    def _load_triples(filename: str, delimiter="\t", use_pickle=False) -> Tensor:
+        if use_pickle:
+            # check if there is a pickled, up-to-date version of the file
+            pickle_suffix = Dataset._to_valid_filename(f"-{delimiter}.pckl")
+            pickle_filename = filename + pickle_suffix
+            triples = Dataset._pickle_load_if_uptodate(None, pickle_filename, filename)
+            if triples is not None:
+                return triples
+
+        triples = np.loadtxt(filename, usecols=range(0, 3), dtype=int)
+        triples = torch.from_numpy(triples)
+        if use_pickle:
+            Dataset._pickle_dump_atomic(triples, pickle_filename)
+        return triples
+
+    def load_triples(self, key: str) -> Tensor:
+        "Load or return the triples with the specified key."
+        if key not in self._triples:
+            filename = self.config.get(f"dataset.files.{key}.filename")
+            filetype = self.config.get(f"dataset.files.{key}.type")
+            if filetype != "triples":
+                raise ValueError(
+                    "Unexpected file type: "
+                    f"dataset.files.{key}.type='{filetype}', expected 'triples'"
+                )
+            triples = Dataset._load_triples(
+                os.path.join(self.folder, filename),
+                use_pickle=self.config.get("dataset.pickle"),
+            )
+            self.config.log(f"Loaded {len(triples)} {key} triples")
+            self._triples[key] = triples
+
+        return self._triples[key]
+
+    @staticmethod
+    def _load_map(
+        filename: str,
+        as_list: bool = False,
+        delimiter: str = "\t",
+        ignore_duplicates=False,
+        use_pickle=False,
+    ) -> Union[List, Dict]:
+        if use_pickle:
+            # check if there is a pickled, up-to-date version of the file
+            pickle_suffix = Dataset._to_valid_filename(
+                f"-{as_list}-{delimiter}-{ignore_duplicates}.pckl"
+            )
+            pickle_filename = filename + pickle_suffix
+            result = Dataset._pickle_load_if_uptodate(None, pickle_filename, filename)
+            if result is not None:
+                return result
+
         n = 0
         dictionary = {}
+        warned_overrides = False
+        duplicates = 0
         with open(filename, "r") as file:
-            reader = csv.reader(file, delimiter="\t")
-            for row in reader:
-                index = int(row[0])
-                meta = row[1:]
-                dictionary[index] = meta
-                n = max(n, index + 1)
-        array = [[]] * n
-        for index, meta in dictionary.items():
-            array[index] = meta
-        return n, array
-
-    @staticmethod
-    def _load_triples(filename):
-        n = 0
-        dictionary = {}
-        with open(filename, "r") as file:
-            reader = csv.reader(file, delimiter="\t")
-            for row in reader:
-                s = int(row[0])
-                p = int(row[1])
-                o = int(row[2])
-                meta = row[3:]
-                dictionary[n] = (torch.IntTensor([s, p, o]), meta)
-                n += 1
-        triples = torch.empty(n, 3, dtype=torch.int32)
-        meta = [[]] * n
-        for index, value in dictionary.items():
-            triples[index, :] = value[0]
-            meta[index] = value[1]
-        return triples, meta
-
-    def index_KvsAll(self, split: str, sp_po: str):
-        """Return an index for the triples in split (''train'', ''valid'', ''test'')
-        from the specified constituents (''sp'' or ''po'') to the indexes of the
-        remaining constituent (''o'' or ''s'', respectively.)
-
-        The index maps from `tuple' to `torch.LongTensor`.
-
-        The index is cached in the provided dataset under name ''split_sp_po''. If
-        this index is already present, does not recompute it.
-
-        """
-        if split == "train":
-            triples = self.train
-        elif split == "valid":
-            triples = self.valid
-        elif split == "test":
-            triples = self.test
+            for line in file:
+                key, value = line.split(delimiter, maxsplit=1)
+                value = value.rstrip("\n")
+                if as_list:
+                    key = int(key)
+                    n = max(n, key + 1)
+                if key in dictionary:
+                    duplicates += 1
+                    if not ignore_duplicates:
+                        raise KeyError(f"{filename} contains duplicated keys")
+                else:
+                    dictionary[key] = value
+        if as_list:
+            array = [None] * n
+            for index, value in dictionary.items():
+                array[index] = value
+            result = (array, duplicates)
         else:
-            raise ValueError()
+            result = (dictionary, duplicates)
 
-        if sp_po == "sp":
-            sp_po_cols = [0, 1]
-            value_column = 2
-        elif sp_po == "po":
-            sp_po_cols = [1, 2]
-            value_column = 0
-        else:
-            raise ValueError()
-
-        name = split + "_" + sp_po
-        if not self.indexes.get(name):
-            self.indexes[name] = Dataset.group_by_sp_po(
-                triples[:, sp_po_cols], triples[:, value_column]
-            )
-            self.config.log(
-                "{} distinct {} pairs in {}".format(
-                    len(self.indexes[name]), sp_po, split
-                ),
-                prefix="  ",
-            )
-
-        return self.indexes.get(name)
-
-    @staticmethod
-    def group_by_sp_po(sp_po_list, o_s_list) -> dict:
-        result = defaultdict(list)
-        for sp_po, o_s in zip(sp_po_list.tolist(), o_s_list.tolist()):
-            result[tuple(sp_po)].append(o_s)
-        for sp_po, o_s in result.items():
-            result[sp_po] = torch.IntTensor(sorted(o_s))
-        return OrderedDict(result)
-
-    @staticmethod
-    def prepare_index(index):
-        sp_po = torch.tensor(list(index.keys()), dtype=torch.int)
-        o_s = torch.cat(list(index.values()))
-        offsets = torch.cumsum(
-            torch.tensor([0] + list(map(len, index.values())), dtype=torch.int), 0
-        )
-        return sp_po, o_s, offsets
-
-    def index_relation_types(self):
-        """
-        create dictionary mapping from {1-N, M-1, 1-1, M-N} -> set of relations
-        """
-        if "relation_types" in self.indexes:
-            return
-        relation_types = self._get_relation_types()
-        relations_per_type = {}
-        for k, v in relation_types.items():
-            relations_per_type.setdefault(v, set()).add(k)
-        for k,v in relations_per_type.items():
-            self.config.log("{} relations of type {}".format(len(v), k), prefix="  ")
-        self.indexes["relation_types"] = relation_types
-        self.indexes["relations_per_type"] = relations_per_type
-
-    def _get_relation_types(self,):
-        """
-        Classify relations into 1-N, M-1, 1-1, M-N
-
-        Bordes, Antoine, et al.
-        "Translating embeddings for modeling multi-relational data."
-        Advances in neural information processing systems. 2013.
-
-        :return: dictionary mapping from int -> {1-N, M-1, 1-1, M-N}
-        """
-        relation_stats = torch.zeros((self.num_relations, 6))
-        for index, p in [
-            (self.index_KvsAll('train', 'sp'), 1),
-            (self.index_KvsAll('train', 'po'), 0),
-        ]:
-            for prefix, labels in index.items():
-                relation_stats[prefix[p], 0+p*2] = labels.float().sum()
-                relation_stats[prefix[p], 1+p*2] = relation_stats[prefix[p], 1+p*2] + 1.
-        relation_stats[:,4] = (relation_stats[:,0]/relation_stats[:,1]) > 1.5
-        relation_stats[:,5] = (relation_stats[:,2]/relation_stats[:,3]) > 1.5
-        result = dict()
-        for i, relation in enumerate(self.relations):
-            result[i] = '{}-{}'.format(
-                '1' if relation_stats[i,4].item() == 0 else 'M',
-                '1' if relation_stats[i,5].item() == 0 else 'N', )
+        if use_pickle:
+            Dataset._pickle_dump_atomic(result, pickle_filename)
         return result
 
-    # TODO this is metadata; refine API
-    def index_frequency_percentiles(self, recompute=False):
+    def load_map(
+        self,
+        key: str,
+        as_list: bool = False,
+        maptype=None,
+        ids_key=None,
+        ignore_duplicates=False,
+    ) -> Union[List, Dict]:
+        """Load or return the map with the specified key.
+
+        If `as_list` is set, the map is converted to an array indexed by the map's keys.
+
+        If `maptype` is set ensures that the map being loaded has the specified type.
+        Valid map types are `map` (keys are indexes) and `idmap` (keys are ids).
+
+        If the map is of type `idmap`, its keys can be converted to indexes by setting
+        `ids_key` to either `entity_ids` or `relation_ids` and `as_list` to `True`.
+
+        If ignore_duplicates is set to `False` and the map contains duplicate keys,
+        raise a `KeyError`. Otherwise, logs a warning and picks first occurrence of a
+        key.
+
         """
-        :return: dictionary mapping from
-        {
-         'subject':
-            {25%, 50%, 75%, top} -> set of entities
-         'relations':
-            {25%, 50%, 75%, top} -> set of relations
-         'object':
-            {25%, 50%, 75%, top} -> set of entities
-        }
+        if key not in self._meta:
+            filename = self.config.get(f"dataset.files.{key}.filename")
+            filetype = self.config.get(f"dataset.files.{key}.type")
+            if (maptype and filetype != maptype) or (
+                not maptype and filetype not in ["map", "idmap"]
+            ):
+                if not maptype:
+                    maptype = "map' or 'idmap"
+                raise ValueError(
+                    "Unexpected file type: "
+                    f"dataset.files.{key}.type='{filetype}', expected {maptype}"
+                )
+            if filetype == "idmap" and as_list and ids_key:
+                map_, duplicates = Dataset._load_map(
+                    os.path.join(self.folder, filename),
+                    as_list=False,
+                    ignore_duplicates=ignore_duplicates,
+                    use_pickle=self.config.get("dataset.pickle"),
+                )
+                ids = self.load_map(ids_key, as_list=True)
+                map_ = [map_.get(ids[i], None) for i in range(len(ids))]
+                nones = map_.count(None)
+                if nones > 0:
+                    self.config.log(
+                        f"Warning: could not find {nones} ids in map {key}; "
+                        "filling with None."
+                    )
+            else:
+                map_, duplicates = Dataset._load_map(
+                    os.path.join(self.folder, filename),
+                    as_list=as_list,
+                    ignore_duplicates=ignore_duplicates,
+                    use_pickle=self.config.get("dataset.pickle"),
+                )
+
+            if duplicates > 0:
+                self.config.log(
+                    f"Warning: map {key} contains {duplicates} duplicate keys, "
+                    "all which have been ignored"
+                )
+            self.config.log(f"Loaded {len(map_)} keys from map {key}")
+            self._meta[key] = map_
+
+        return self._meta[key]
+
+    def shallow_copy(self):
+        """Returns a dataset that shares the underlying splits and indexes.
+
+        Changes to splits and indexes are also reflected on this and the copied dataset.
         """
-        if "frequency_percentiles" in self.indexes:
-            return
-        subject_stats = torch.zeros((self.num_entities, 1))
-        relation_stats = torch.zeros((self.num_relations, 1))
-        object_stats = torch.zeros((self.num_entities, 1))
-        for (s,p,o) in self.train:
-            subject_stats[s] += 1
-            relation_stats[p] += 1
-            object_stats[o] += 1
-        result = dict()
-        for arg, stats, num in [
-            ('subject', [i for i,j in list(sorted(enumerate(subject_stats.tolist()), key=lambda x:x[1]))], self.num_entities),
-            ('relation', [i for i,j in list(sorted(enumerate(relation_stats.tolist()), key=lambda x:x[1]))], self.num_relations),
-            ('object', [i for i,j in list(sorted(enumerate(object_stats.tolist()), key=lambda x:x[1]))], self.num_entities),
-        ]:
-            for percentile, (begin, end) in [('25%', (0., 0.25)), ('50%', (0.25, 0.5)), ('75%', (0.5, 0.75)), ('top', (0.75, 1.))]:
-                if arg not in result:
-                    result[arg] = dict()
-                result[arg][percentile] = set(stats[int(begin*num):int(end*num)])
-        self.indexes["frequency_percentiles"] = result
+        copy = Dataset(self.config, self.folder)
+        copy._num_entities = self.num_entities()
+        copy._num_relations = self.num_relations()
+        copy._triples = self._triples
+        copy._meta = self._meta
+        copy._indexes = self._indexes
+        copy.index_functions = self.index_functions
+        return copy
+
+    def _get_newest_mtime(self, data_filenames=None):
+        """Return the timestamp of latest modification of relevant data files.
+
+        If `data_filenames` is `None`, return latest modification of relevant modules or
+        any of the dataset files given in the configuration.
+
+        Otherwise, return latest modification of relevant modules or any of the
+        specified files.
+
+        """
+        newest_timestamp = max(
+            os.path.getmtime(inspect.getfile(Dataset)),
+            os.path.getmtime(inspect.getfile(kge.indexing)),
+        )
+        if data_filenames is None:
+            data_filenames = []
+            for key, entry in self.config.get("dataset.files").items():
+                filename = os.path.join(self.folder, entry["filename"])
+                data_filenames.append(filename)
+
+        if isinstance(data_filenames, str):
+            data_filenames = [data_filenames]
+
+        for filename in data_filenames:
+            if os.path.isfile(filename):
+                timestamp = os.path.getmtime(filename)
+                newest_timestamp = max(newest_timestamp, timestamp)
+
+        return newest_timestamp
+
+    def _pickle_load_if_uptodate(
+        self, pickle_filename: str, data_filenames: List[str] = None
+    ):
+        """Load the specified pickle file if it's up-to-date.
+
+        The `data_filenames` argument is as specified in `_get_newest_mtime`. If
+        `data_filenames` is not `None`, `self` can be `None`.
+
+        Returns `None` if the pickled file is not present or if it is outdated.
+
+        """
+        if os.path.isfile(pickle_filename):
+            if os.path.getmtime(pickle_filename) > Dataset._get_newest_mtime(
+                self, data_filenames
+            ):  # self may be None
+                with open(pickle_filename, "rb") as f:
+                    return pickle.load(f)
+            elif Dataset._abort_when_cache_outdated:
+                pickle_filename = os.path.abspath(pickle_filename)
+                pickle_dir = os.path.dirname(pickle_filename)
+                raise ValueError(
+                    f"""Cached dataset file
+  {pickle_filename}
+is outdated.
+
+If unsure what to do, remove the command line option '--abort-when-cache-outdated' and
+rerun to recompute the outdated file.
+
+BEWARE: If you are an expert user who understands clearly why the file is outdated AND
+that it does not need to be recomputed, you can update the timestamp of the filename as
+follows:
+
+  touch {pickle_filename}
+
+NOT RECOMMENDED: You can update the timestamp of all cached files using:
+
+  touch {pickle_dir}/*.pckl
+"""
+                )
+        else:
+            return None
+
+    @staticmethod
+    def _pickle_dump_atomic(data, pickle_filename):
+        # first write to temporary file
+        tmpfile = pickle_filename + ".tmp"
+        with open(tmpfile, "wb") as f:
+            pickle.dump(data, f)
+
+        # then do an atomic replace
+        os.replace(tmpfile, pickle_filename)
+
+    ## ACCESS ###########################################################################
+
+    def files_of_type(self, file_type: str) -> List[str]:
+        "Return all keys of files with the specified type."
+        return [
+            key
+            for key, entry in self.config.get("dataset.files").items()
+            if entry["type"] == file_type
+        ]
+
+    def num_entities(self) -> int:
+        "Return the number of entities in this dataset."
+        if not self._num_entities:
+            self._num_entities = len(self.entity_ids())
+        return self._num_entities
+
+    def num_relations(self) -> int:
+        "Return the number of relations in this dataset."
+        if not self._num_relations:
+            self._num_relations = len(self.relation_ids())
+        return self._num_relations
+
+    def split(self, split: str) -> Tensor:
+        """Return the split of the specified name.
+
+        If the split is not yet loaded, load it. Returns an Nx3 IntTensor of
+        spo-triples.
+
+        """
+        return self.load_triples(split)
+
+    def entity_ids(
+        self, indexes: Optional[Union[int, Tensor]] = None
+    ) -> Union[str, List[str], np.ndarray]:
+        """Decode indexes to entity ids.
+
+        See `Dataset#map_indexes` for a description of the `indexes` argument.
+        """
+        return self.map_indexes(indexes, "entity_ids")
+
+    def relation_ids(
+        self, indexes: Optional[Union[int, Tensor]] = None
+    ) -> Union[str, List[str], np.ndarray]:
+        """Decode indexes to relation ids.
+
+        See `Dataset#map_indexes` for a description of the `indexes` argument.
+        """
+        return self.map_indexes(indexes, "relation_ids")
+
+    def entity_strings(
+        self, indexes: Optional[Union[int, Tensor]] = None
+    ) -> Union[str, List[str], np.ndarray]:
+        """Decode indexes to entity strings.
+
+        See `Dataset#map_indexes` for a description of the `indexes` argument.
+
+        """
+        map_ = self.load_map(
+            "entity_strings", as_list=True, ids_key="entity_ids", ignore_duplicates=True
+        )
+        return self._map_indexes(indexes, map_)
+
+    def relation_strings(
+        self, indexes: Optional[Union[int, Tensor]] = None
+    ) -> Union[str, List[str], np.ndarray]:
+        """Decode indexes to relation strings.
+
+        See `Dataset#map_indexes` for a description of the `indexes` argument.
+
+        """
+        map_ = self.load_map(
+            "relation_strings",
+            as_list=True,
+            ids_key="relation_ids",
+            ignore_duplicates=True,
+        )
+        return self._map_indexes(indexes, map_)
+
+    def meta(self, key: str) -> Any:
+        """Return metadata stored under the specified key."""
+        return self._meta[key]
+
+    def index(self, key: str) -> Any:
+        """Return the index stored under the specified key.
+
+        Index means any data structure that is derived from the dataset, including
+        statistics and indexes.
+
+        If the index has not yet been computed, computes it by calling the function
+        specified in `self.index_functions`.
+
+        See `kge.indexing.create_default_index_functions()` for the indexes available by
+        default.
+
+        """
+        if key not in self._indexes:
+            use_pickle = self.config.get("dataset.pickle")
+            if use_pickle:
+                pickle_filename = os.path.join(
+                    self.folder, Dataset._to_valid_filename(f"index-{key}.pckl")
+                )
+                index = self._pickle_load_if_uptodate(pickle_filename)
+                if index is not None:
+                    self._indexes[key] = index
+                    # call index function solely to print log messages. It's
+                    # expected to note recompute the index (which we just loaded)
+                    if key in self.index_functions:
+                        self.index_functions[key](self)
+
+                    return self._indexes[key]
+
+            self.index_functions[key](self)
+            if use_pickle:
+                Dataset._pickle_dump_atomic(self._indexes[key], pickle_filename)
+
+        return self._indexes[key]
+
+    @staticmethod
+    def _map_indexes(indexes, values):
+        "Return the names corresponding to specified indexes"
+        if indexes is None:
+            return values
+        elif isinstance(indexes, int):
+            return values[indexes]
+        else:
+            shape = indexes.shape
+            indexes = indexes.view(-1)
+            names = np.array(list(map(lambda i: values[i], indexes)), dtype=str)
+            return names.reshape(shape)
+
+    def map_indexes(
+        self, indexes: Optional[Union[int, Tensor]], key: str
+    ) -> Union[Any, List[Any], np.ndarray]:
+        """Maps indexes to values using the specified map.
+
+        `key` refers to the key of a map file of the dataset, which associates a value
+        with each numerical index. The map file is loaded automatically.
+
+        If `indexes` is `None`, return all values. If `indexes` is an integer, return
+        the corresponding value. If `indexes` is a Tensor, return an ndarray of the same
+        shape holding the corresponding values.
+
+        """
+        map_ = self.load_map(key, as_list=True)
+        return Dataset._map_indexes(indexes, map_)

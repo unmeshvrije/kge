@@ -2,20 +2,42 @@ import itertools
 import os
 import math
 import time
+from collections import defaultdict
+
+from dataclasses import dataclass
 
 import torch
 import torch.utils.data
+import numpy as np
 
 from kge import Config, Dataset
 from kge.job import Job
 from kge.model import KgeModel
 
-from kge.util import KgeLoss, KgeOptimizer, KgeNegativeSampler, KgeLRScheduler
+from kge.util import KgeLoss, KgeOptimizer, KgeSampler, KgeLRScheduler
 from typing import Any, Callable, Dict, List, Optional
 import kge.job.util
 
 SLOTS = [0, 1, 2]
 S, P, O = SLOTS
+
+
+def _generate_worker_init_fn(config):
+    "Initialize workers of a DataLoader"
+    use_fixed_seed = config.get("random_seed.numpy") >= 0
+
+    def worker_init_fn(worker_num):
+        # ensure that NumPy uses different seeds at each worker
+        if use_fixed_seed:
+            # reseed based on current seed (same for all workers) and worker number
+            # (different)
+            base_seed = np.random.randint(2 ** 32 - 1)
+            np.random.seed(base_seed + worker_num)
+        else:
+            # reseed fresh
+            np.random.seed()
+
+    return worker_init_fn
 
 
 class TrainingJob(Job):
@@ -24,7 +46,7 @@ class TrainingJob(Job):
     Also used by jobs such as :class:`SearchJob`.
 
     Subclasses for specific training methods need to implement `_prepare` and
-    `_compute_batch_loss`.
+    `_process_batch`.
 
     """
 
@@ -36,15 +58,16 @@ class TrainingJob(Job):
         super().__init__(config, dataset, parent_job)
         self.model: KgeModel = KgeModel.create(config, dataset)
         self.optimizer = KgeOptimizer.create(config, self.model)
-        self.lr_scheduler, self.metric_based_scheduler = KgeLRScheduler.create(
-            config, self.optimizer
-        )
+        self.kge_lr_scheduler = KgeLRScheduler(config, self.optimizer)
         self.loss = KgeLoss.create(config)
+        self.abort_on_nan: bool = config.get("train.abort_on_nan")
         self.batch_size: int = config.get("train.batch_size")
         self.device: str = self.config.get("job.device")
+        self.train_split = config.get("train.split")
         valid_conf = config.clone()
         valid_conf.set("job.type", "eval")
-        valid_conf.set("eval.data", "valid")
+        if self.config.get("valid.split") != "":
+            valid_conf.set("eval.split", self.config.get("valid.split"))
         valid_conf.set("eval.trace_level", self.config.get("valid.trace_level"))
         self.valid_job = EvaluationJob.create(
             valid_conf, dataset, parent_job=self, model=self.model
@@ -63,27 +86,27 @@ class TrainingJob(Job):
 
         #: Hooks run after training for an epoch.
         #: Signature: job, trace_entry
-        self.post_epoch_hooks: List[Callable[[Job, Dict[str, Any]]]] = []
+        self.post_epoch_hooks: List[Callable[[Job, Dict[str, Any]], Any]] = []
 
         #: Hooks run before starting a batch.
         #: Signature: job
-        self.pre_batch_hooks: List[Callable[[Job]]] = []
+        self.pre_batch_hooks: List[Callable[[Job], Any]] = []
 
         #: Hooks run before outputting the trace of a batch. Can modify trace entry.
         #: Signature: job, trace_entry
-        self.post_batch_trace_hooks: List[Callable[[Job, Dict[str, Any]]]] = []
+        self.post_batch_trace_hooks: List[Callable[[Job, Dict[str, Any]], Any]] = []
 
         #: Hooks run before outputting the trace of an epoch. Can modify trace entry.
         #: Signature: job, trace_entry
-        self.post_epoch_trace_hooks: List[Callable[[Job, Dict[str, Any]]]] = []
+        self.post_epoch_trace_hooks: List[Callable[[Job, Dict[str, Any]], Any]] = []
 
         #: Hooks run after a validation job.
         #: Signature: job, trace_entry
-        self.post_valid_hooks: List[Callable[[Job, Dict[str, Any]]]] = []
+        self.post_valid_hooks: List[Callable[[Job, Dict[str, Any]], Any]] = []
 
         #: Hooks run after training
         #: Signature: job, trace_entry
-        self.post_train_hooks: List[Callable[[Job, Dict[str, Any]]]] = []
+        self.post_train_hooks: List[Callable[[Job, Dict[str, Any]], Any]] = []
 
         if self.__class__ == TrainingJob:
             for f in Job.job_created_hooks:
@@ -114,7 +137,10 @@ class TrainingJob(Job):
         while True:
             # checking for model improvement according to metric_name
             # and do early stopping and keep the best checkpoint
-            if len(self.valid_trace) > 0:
+            if (
+                len(self.valid_trace) > 0
+                and self.valid_trace[-1]["epoch"] == self.epoch
+            ):
                 best_index = max(
                     range(len(self.valid_trace)),
                     key=lambda index: self.valid_trace[index][metric_name],
@@ -164,7 +190,7 @@ class TrainingJob(Job):
             self.model.meta["train_config"] = self.config
             self.model.meta["train_trace_entry"] = trace_entry
 
-            # validate
+            # validate and update learning rate
             if (
                 self.config.get("valid.every") > 0
                 and self.epoch % self.config.get("valid.every") == 0
@@ -177,12 +203,9 @@ class TrainingJob(Job):
                 self.model.meta["valid_trace_entry"] = trace_entry
 
                 # metric-based scheduler step
-                if self.metric_based_scheduler:
-                    self.lr_scheduler.step(trace_entry[metric_name])
-
-            # epoch-based scheduler step
-            if self.lr_scheduler and not self.metric_based_scheduler:
-                self.lr_scheduler.step(self.epoch)
+                self.kge_lr_scheduler.step(trace_entry[metric_name])
+            else:
+                self.kge_lr_scheduler.step()
 
             # create checkpoint and delete old one, if necessary
             self.save(self.config.checkpoint_file(self.epoch))
@@ -218,17 +241,20 @@ class TrainingJob(Job):
 
         for f in self.post_train_hooks:
             f(self, trace_entry)
+        self.trace(event="train_completed")
 
     def save(self, filename) -> None:
         """Save current state to specified file"""
         self.config.log("Saving checkpoint to {}...".format(filename))
         torch.save(
             {
+                "type": "train",
                 "config": self.config,
                 "epoch": self.epoch,
                 "valid_trace": self.valid_trace,
                 "model": self.model.save(),
                 "optimizer_state_dict": self.optimizer.state_dict(),
+                "lr_scheduler_state_dict": self.kge_lr_scheduler.state_dict(),
                 "job_id": self.job_id,
             },
             filename,
@@ -247,6 +273,9 @@ class TrainingJob(Job):
             # old format (deprecated, will eventually be removed)
             self.model.load_state_dict(checkpoint["model_state_dict"])
         self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if "lr_scheduler_state_dict" in checkpoint:
+            # new format
+            self.kge_lr_scheduler.load_state_dict(checkpoint["lr_scheduler_state_dict"])
         self.epoch = checkpoint["epoch"]
         self.valid_trace = checkpoint["valid_trace"]
         self.model.train()
@@ -260,6 +289,9 @@ class TrainingJob(Job):
 
         if checkpoint_file is not None:
             self.resumed_from_job_id = self.load(checkpoint_file)
+            self.trace(
+                event="job_resumed", epoch=self.epoch, checkpoint_file=checkpoint_file
+            )
             self.config.log(
                 "Resumed from {} of job {}".format(
                     checkpoint_file, self.resumed_from_job_id
@@ -280,7 +312,7 @@ class TrainingJob(Job):
         # variables that record various statitics
         sum_loss = 0.0
         sum_penalty = 0.0
-        sum_penalties = []
+        sum_penalties = defaultdict(lambda: 0.0)
         epoch_time = -time.time()
         prepare_time = 0.0
         forward_time = 0.0
@@ -292,72 +324,60 @@ class TrainingJob(Job):
             for f in self.pre_batch_hooks:
                 f(self)
 
-            # preprocess batch and perform forward pass
+            # process batch (preprocessing + forward pass + backward pass on loss)
             self.optimizer.zero_grad()
-            loss_value, batch_size, batch_prepare_time, batch_forward_time = self._compute_batch_loss(
+            batch_result: TrainingJob._ProcessBatchResult = self._process_batch(
                 batch_index, batch
             )
-            sum_loss += loss_value.item() * batch_size
-            prepare_time += batch_prepare_time
+            sum_loss += batch_result.avg_loss * batch_result.size
 
-            # determine penalty terms (part of forward pass)
-            batch_forward_time -= time.time()
-            penalty_value = torch.zeros(1, device=self.device)
-            penalty_values = self.model.penalty(
+            # determine penalty terms (forward pass)
+            batch_forward_time = batch_result.forward_time - time.time()
+            penalties_torch = self.model.penalty(
                 epoch=self.epoch,
                 batch_index=batch_index,
                 num_batches=len(self.loader),
                 batch=batch,
             )
-            for pv_index, pv_value in enumerate(penalty_values):
-                penalty_value = penalty_value + pv_value
-                if len(sum_penalties) > pv_index:
-                    sum_penalties[pv_index] += pv_value.item()
-                else:
-                    sum_penalties.append(pv_value.item())
-            sum_penalty += penalty_value.item()
             batch_forward_time += time.time()
 
-            # determine full cost
-            cost_value = loss_value + penalty_value
-            forward_time += batch_forward_time
-
-            # visualize graph
-            if (
-                self.epoch == 1
-                and batch_index == 0
-                and self.config.get("train.visualize_graph")
-            ):
-                from torchviz import make_dot
-
-                f = os.path.join(self.config.folder, "cost_value")
-                graph = make_dot(cost_value, params=dict(self.model.named_parameters()))
-                graph.save(f"{f}.gv")
-                graph.render(f)  # needs graphviz installed
-                self.config.log("Exported compute graph to " + f + ".{gv,pdf}")
-
-            # print memory stats
-            if self.epoch == 1 and batch_index == 0:
-                if self.device.startswith("cuda"):
-                    self.config.log(
-                        "CUDA memory after forward pass: allocated={:14,} cached={:14,} max_allocated={:14,}".format(
-                            torch.cuda.memory_allocated(self.device),
-                            torch.cuda.memory_cached(self.device),
-                            torch.cuda.max_memory_allocated(self.device),
-                        )
-                    )
-
-            # backward pass
-            batch_backward_time = -time.time()
-            cost_value.backward()
+            # backward pass on penalties
+            batch_backward_time = batch_result.backward_time - time.time()
+            penalty = 0.0
+            for index, (penalty_key, penalty_value_torch) in enumerate(penalties_torch):
+                penalty_value_torch.backward()
+                penalty += penalty_value_torch.item()
+                sum_penalties[penalty_key] += penalty_value_torch.item()
+            sum_penalty += penalty
             batch_backward_time += time.time()
-            backward_time += batch_backward_time
+
+            # determine full cost
+            cost_value = batch_result.avg_loss + penalty
+
+            # abort on nan
+            if self.abort_on_nan and math.isnan(cost_value):
+                raise FloatingPointError("Cost became nan, aborting training job")
+
+            # TODO # visualize graph
+            # if (
+            #     self.epoch == 1
+            #     and batch_index == 0
+            #     and self.config.get("train.visualize_graph")
+            # ):
+            #     from torchviz import make_dot
+
+            #     f = os.path.join(self.config.folder, "cost_value")
+            #     graph = make_dot(cost_value, params=dict(self.model.named_parameters()))
+            #     graph.save(f"{f}.gv")
+            #     graph.render(f)  # needs graphviz installed
+            #     self.config.log("Exported compute graph to " + f + ".{gv,pdf}")
 
             # print memory stats
             if self.epoch == 1 and batch_index == 0:
                 if self.device.startswith("cuda"):
                     self.config.log(
-                        "CUDA memory after backwrd pass: allocated={:14,} cached={:14,} max_allocated={:14,}".format(
+                        "CUDA memory after first batch: allocated={:14,} "
+                        "cached={:14,} max_allocated={:14,}".format(
                             torch.cuda.memory_allocated(self.device),
                             torch.cuda.memory_cached(self.device),
                             torch.cuda.max_memory_allocated(self.device),
@@ -368,7 +388,6 @@ class TrainingJob(Job):
             batch_optimizer_time = -time.time()
             self.optimizer.step()
             batch_optimizer_time += time.time()
-            optimizer_time += batch_optimizer_time
 
             # tracing/logging
             if self.trace_batch:
@@ -376,36 +395,39 @@ class TrainingJob(Job):
                     "type": self.type_str,
                     "scope": "batch",
                     "epoch": self.epoch,
+                    "split": self.train_split,
                     "batch": batch_index,
-                    "size": batch_size,
+                    "size": batch_result.size,
                     "batches": len(self.loader),
-                    "avg_loss": loss_value.item(),
-                    "penalties": [p.item() for p in penalty_values],
-                    "penalty": penalty_value.item(),
-                    "cost": cost_value.item(),
-                    "prepare_time": batch_prepare_time,
+                    "lr": [group["lr"] for group in self.optimizer.param_groups],
+                    "avg_loss": batch_result.avg_loss,
+                    "penalties": [p.item() for k, p in penalties_torch],
+                    "penalty": penalty,
+                    "cost": cost_value,
+                    "prepare_time": batch_result.prepare_time,
                     "forward_time": batch_forward_time,
                     "backward_time": batch_backward_time,
                     "optimizer_time": batch_optimizer_time,
                 }
                 for f in self.post_batch_trace_hooks:
                     f(self, batch_trace)
-                self.trace(**batch_trace)
+                self.trace(**batch_trace, event="batch_completed")
             print(
                 (
                     "\r"  # go back
                     + "{}  batch{: "
                     + str(1 + int(math.ceil(math.log10(len(self.loader)))))
-                    + "d}/{}, loss {:.4E}, penalty {:.4E}, cost {:.4E}, time {:6.2f}s"
+                    + "d}/{}"
+                    + ", avg_loss {:.4E}, penalty {:.4E}, cost {:.4E}, time {:6.2f}s"
                     + "\033[K"  # clear to right
                 ).format(
                     self.config.log_prefix,
                     batch_index,
                     len(self.loader) - 1,
-                    loss_value.item(),
-                    penalty_value.item(),
-                    cost_value.item(),
-                    batch_prepare_time
+                    batch_result.avg_loss,
+                    penalty,
+                    cost_value,
+                    batch_result.prepare_time
                     + batch_forward_time
                     + batch_backward_time
                     + batch_optimizer_time,
@@ -413,6 +435,12 @@ class TrainingJob(Job):
                 end="",
                 flush=True,
             )
+
+            # update times
+            prepare_time += batch_result.prepare_time
+            forward_time += batch_forward_time
+            backward_time += batch_backward_time
+            optimizer_time += batch_optimizer_time
 
         # all done; now trace and log
         epoch_time += time.time()
@@ -425,11 +453,13 @@ class TrainingJob(Job):
             type=self.type_str,
             scope="epoch",
             epoch=self.epoch,
+            split=self.train_split,
             batches=len(self.loader),
             size=self.num_examples,
+            lr=[group["lr"] for group in self.optimizer.param_groups],
             avg_loss=sum_loss / self.num_examples,
             avg_penalty=sum_penalty / len(self.loader),
-            avg_penalties=[p / len(self.loader) for p in sum_penalties],
+            avg_penalties={k: p / len(self.loader) for k, p in sum_penalties.items()},
             avg_cost=sum_loss / self.num_examples + sum_penalty / len(self.loader),
             epoch_time=epoch_time,
             prepare_time=prepare_time,
@@ -437,6 +467,7 @@ class TrainingJob(Job):
             backward_time=backward_time,
             optimizer_time=optimizer_time,
             other_time=other_time,
+            event="epoch_completed",
         )
         for f in self.post_epoch_trace_hooks:
             f(self, trace_entry)
@@ -455,12 +486,34 @@ class TrainingJob(Job):
         """
         raise NotImplementedError
 
-    def _compute_batch_loss(self, batch_index, batch):
-        "Returns loss_value (avg over batch), batch size, prepare time, forward time."
+    @dataclass
+    class _ProcessBatchResult:
+        """Result of running forward+backward pass on a batch."""
+
+        avg_loss: float
+        size: int
+        prepare_time: float
+        forward_time: float
+        backward_time: float
+
+    def _process_batch(
+        self, batch_index: int, batch
+    ) -> "TrainingJob._ProcessBatchResult":
+        "Run forward and backward pass on batch and return results."
         raise NotImplementedError
 
 
 class TrainingJobKvsAll(TrainingJob):
+    """Train with examples consisting of a query and its answers.
+
+    Terminology:
+    - Query type: which queries to ask (sp_, s_o, and/or _po), can be configured via
+      configuration key `KvsAll.query_type` (which see)
+    - Query: a particular query, e.g., (John,marriedTo) of type sp_
+    - Labels: list of true answers of a query (e.g., [Jane])
+    - Example: a query + its labels, e.g., (John,marriedTo), [Jane]
+    """
+
     def __init__(self, config, dataset, parent_job=None):
         super().__init__(config, dataset, parent_job)
         self.label_smoothing = config.check_range(
@@ -479,22 +532,22 @@ class TrainingJobKvsAll(TrainingJob):
                     "should be at least 0.".format(self.label_smoothing)
                 )
         elif self.label_smoothing > 0 and self.label_smoothing <= (
-            1.0 / dataset.num_entities
+            1.0 / dataset.num_entities()
         ):
             if config.get("train.auto_correct"):
                 # just to be sure it's used correctly
                 config.log(
-                    "Setting label_smoothing to 1/dataset.num_entities = {}, "
+                    "Setting label_smoothing to 1/num_entities = {}, "
                     "was set to {}.".format(
-                        1.0 / dataset.num_entities, self.label_smoothing
+                        1.0 / dataset.num_entities(), self.label_smoothing
                     )
                 )
-                self.label_smoothing = 1.0 / dataset.num_entities
+                self.label_smoothing = 1.0 / dataset.num_entities()
             else:
                 raise Exception(
                     "Label_smoothing was set to {}, "
                     "should be at least {}.".format(
-                        self.label_smoothing, 1.0 / dataset.num_entities
+                        self.label_smoothing, 1.0 / dataset.num_entities()
                     )
                 )
 
@@ -506,155 +559,240 @@ class TrainingJobKvsAll(TrainingJob):
                 f(self)
 
     def _prepare(self):
-        # create sp and po label_coords (if not done before)
-        train_sp = self.dataset.index_KvsAll("train", "sp")
-        train_po = self.dataset.index_KvsAll("train", "po")
+        from kge.indexing import index_KvsAll_to_torch
 
-        # convert indexes to pytoch tensors: a nx2 keys tensor (rows = keys),
-        # an offset vector (row = starting offset in values for corresponding
-        # key), a values vector (entries correspond to values of original
-        # index)
-        #
-        # Afterwards, it holds:
-        # index[keys[i]] = values[offsets[i]:offsets[i+1]]
+        # determine enabled query types
+        self.query_types = [
+            key
+            for key, enabled in self.config.get("KvsAll.query_types").items()
+            if enabled
+        ]
 
-        self.train_sp_keys, self.train_sp_values, self.train_sp_offsets = Dataset.prepare_index(
-            train_sp
-        )
-        self.train_po_keys, self.train_po_values, self.train_po_offsets = Dataset.prepare_index(
-            train_po
-        )
+        #' for each query type: list of queries
+        self.queries = {}
+
+        #' for each query type: list of all labels (concatenated across queries)
+        self.labels = {}
+
+        #' for each query type: list of starting offset of labels in self.labels. The
+        #' labels for the i-th query of query_type are in labels[query_type] in range
+        #' label_offsets[query_type][i]:label_offsets[query_type][i+1]
+        self.label_offsets = {}
+
+        #' for each query type (ordered as in self.query_types), index right after last
+        #' example of that type in the list of all examples
+        self.query_end_index = []
+
+        # construct relevant data structures
+        self.num_examples = 0
+        for query_type in self.query_types:
+            index_type = (
+                "sp_to_o"
+                if query_type == "sp_"
+                else ("so_to_p" if query_type == "s_o" else "po_to_s")
+            )
+            index = self.dataset.index(f"{self.train_split}_{index_type}")
+            self.num_examples += len(index)
+            self.query_end_index.append(self.num_examples)
+
+            # Convert indexes to pytorch tensors (as described above).
+            (
+                self.queries[query_type],
+                self.labels[query_type],
+                self.label_offsets[query_type],
+            ) = index_KvsAll_to_torch(index)
 
         # create dataloader
         self.loader = torch.utils.data.DataLoader(
-            range(len(train_sp) + len(train_po)),
+            range(self.num_examples),
             collate_fn=self._get_collate_fun(),
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.config.get("train.num_workers"),
+            worker_init_fn=_generate_worker_init_fn(self.config),
             pin_memory=self.config.get("train.pin_memory"),
         )
-        self.num_examples = len(train_sp) + len(train_po)
 
     def _get_collate_fun(self):
-        num_sp = len(self.train_sp_keys)
-
         # create the collate function
         def collate(batch):
-            """For a batch of size n, returns a triple of:
+            """For a batch of size n, returns a dictionary of:
 
-            - pairs (nx2 tensor, row = sp or po indexes),
-            - label coordinates (position of ones in a batch_size x num_entities tensor)
-            - is_sp (vector of size n, 1 if corresponding example_index is sp, 0 if po)
+            - queries: nx2 tensor, row = query (sp, po, or so indexes)
+            - label_coords: for each query, position of true answers (an Nx2 tensor,
+              first columns holds query index, second colum holds index of label)
+            - query_type_indexes (vector of size n holding the query type of each query)
+            - triples (all true triples in the batch; e.g., needed for weighted
+              penalties)
 
             """
-            # count how many labels we have
+
+            # count how many labels we have across the entire batch
             num_ones = 0
             for example_index in batch:
-                if example_index < num_sp:
-                    num_ones += self.train_sp_offsets[example_index + 1]
-                    num_ones -= self.train_sp_offsets[example_index]
-                else:
-                    example_index -= num_sp
-                    num_ones += self.train_po_offsets[example_index + 1]
-                    num_ones -= self.train_po_offsets[example_index]
+                start = 0
+                for query_type_index, query_type in enumerate(self.query_types):
+                    end = self.query_end_index[query_type_index]
+                    if example_index < end:
+                        example_index -= start
+                        num_ones += self.label_offsets[query_type][example_index + 1]
+                        num_ones -= self.label_offsets[query_type][example_index]
+                        break
+                    start = end
 
-            # now create the results
-            sp_po_batch = torch.zeros([len(batch), 2], dtype=torch.long)
-            is_sp = torch.zeros([len(batch)], dtype=torch.long)
-            label_coords = torch.zeros([num_ones, 2], dtype=torch.int)
+            # now create the batch elements
+            queries_batch = torch.zeros([len(batch), 2], dtype=torch.long)
+            query_type_indexes_batch = torch.zeros([len(batch)], dtype=torch.long)
+            label_coords_batch = torch.zeros([num_ones, 2], dtype=torch.int)
+            triples_batch = torch.zeros([num_ones, 3], dtype=torch.long)
             current_index = 0
-            triples = torch.zeros([num_ones, 3], dtype=torch.long)
             for batch_index, example_index in enumerate(batch):
-                is_sp[batch_index] = 1 if example_index < num_sp else 0
-                if is_sp[batch_index]:
-                    keys = self.train_sp_keys
-                    offsets = self.train_sp_offsets
-                    values = self.train_sp_values
-                    sp_po_col_1, sp_po_col_2, o_s_col = S, P, O
-                else:
-                    example_index -= num_sp
-                    keys = self.train_po_keys
-                    offsets = self.train_po_offsets
-                    values = self.train_po_values
-                    o_s_col, sp_po_col_1, sp_po_col_2 = S, P, O
+                start = 0
+                for query_type_index, query_type in enumerate(self.query_types):
+                    end = self.query_end_index[query_type_index]
+                    if example_index < end:
+                        example_index -= start
+                        query_type_indexes_batch[batch_index] = query_type_index
+                        queries = self.queries[query_type]
+                        label_offsets = self.label_offsets[query_type]
+                        labels = self.labels[query_type]
+                        if query_type == "sp_":
+                            query_col_1, query_col_2, target_col = S, P, O
+                        elif query_type == "s_o":
+                            query_col_1, target_col, query_col_2 = S, P, O
+                        else:
+                            target_col, query_col_1, query_col_2 = S, P, O
+                        break
+                    start = end
 
-                sp_po_batch[batch_index,] = keys[example_index]
-                start = offsets[example_index]
-                end = offsets[example_index + 1]
+                queries_batch[batch_index,] = queries[example_index]
+                start = label_offsets[example_index]
+                end = label_offsets[example_index + 1]
                 size = end - start
-                label_coords[current_index : (current_index + size), 0] = batch_index
-                label_coords[current_index : (current_index + size), 1] = values[
+                label_coords_batch[
+                    current_index : (current_index + size), 0
+                ] = batch_index
+                label_coords_batch[current_index : (current_index + size), 1] = labels[
                     start:end
                 ]
-                triples[current_index : (current_index + size), sp_po_col_1] = keys[
-                    example_index
-                ][0]
-                triples[current_index : (current_index + size), sp_po_col_2] = keys[
-                    example_index
-                ][1]
-                triples[current_index : (current_index + size), o_s_col] = values[
-                    start:end
-                ]
+                triples_batch[
+                    current_index : (current_index + size), query_col_1
+                ] = queries[example_index][0]
+                triples_batch[
+                    current_index : (current_index + size), query_col_2
+                ] = queries[example_index][1]
+                triples_batch[
+                    current_index : (current_index + size), target_col
+                ] = labels[start:end]
                 current_index += size
 
             # all done
             return {
-                "sp_po_batch": sp_po_batch,
-                "label_coords": label_coords,
-                "is_sp": is_sp,
-                "triples": triples,
+                "queries": queries_batch,
+                "label_coords": label_coords_batch,
+                "query_type_indexes": query_type_indexes_batch,
+                "triples": triples_batch,
             }
 
         return collate
 
-    def _compute_batch_loss(self, batch_index, batch):
+    def _process_batch(self, batch_index, batch) -> TrainingJob._ProcessBatchResult:
         # prepare
-        batch_prepare_time = -time.time()
-        sp_po_batch = batch["sp_po_batch"].to(self.device)
-        batch_size = len(sp_po_batch)
-        label_coords = batch["label_coords"].to(self.device)
-        is_sp = batch["is_sp"]
-        sp_indexes = is_sp.nonzero().to(self.device).view(-1)
-        po_indexes = (is_sp == 0).nonzero().to(self.device).view(-1)
-        labels = kge.job.util.coord_to_sparse_tensor(
-            batch_size, self.dataset.num_entities, label_coords, self.device
+        prepare_time = -time.time()
+        queries_batch = batch["queries"].to(self.device)
+        batch_size = len(queries_batch)
+        label_coords_batch = batch["label_coords"].to(self.device)
+        query_type_indexes_batch = batch["query_type_indexes"]
+
+        # in this method, example refers to the index of an example in the batch, i.e.,
+        # it takes values in 0,1,...,batch_size-1
+        examples_for_query_type = {}
+        for query_type_index, query_type in enumerate(self.query_types):
+            examples_for_query_type[query_type] = (
+                (query_type_indexes_batch == query_type_index)
+                .nonzero()
+                .to(self.device)
+                .view(-1)
+            )
+
+        labels_batch = kge.job.util.coord_to_sparse_tensor(
+            batch_size,
+            max(self.dataset.num_entities(), self.dataset.num_relations()),
+            label_coords_batch,
+            self.device,
         ).to_dense()
+        labels_for_query_type = {}
+        for query_type, examples in examples_for_query_type.items():
+            if query_type == "s_o":
+                labels_for_query_type[query_type] = labels_batch[
+                    examples, : self.dataset.num_relations()
+                ]
+            else:
+                labels_for_query_type[query_type] = labels_batch[
+                    examples, : self.dataset.num_entities()
+                ]
+
         if self.label_smoothing > 0.0:
             # as in ConvE: https://github.com/TimDettmers/ConvE
-            labels = (1.0 - self.label_smoothing) * labels + 1.0 / labels.size(1)
-        batch_prepare_time += time.time()
+            for query_type, labels in labels_for_query_type.items():
+                if query_type != "s_o":  # entity targets only for now
+                    labels_for_query_type[query_type] = (
+                        1.0 - self.label_smoothing
+                    ) * labels + 1.0 / labels.size(1)
 
-        # forward pass
-        batch_forward_time = -time.time()
-        loss_value = torch.zeros(1, device=self.device)
-        if len(sp_indexes) > 0:
-            scores_sp = self.model.score_sp(
-                sp_po_batch[sp_indexes, 0], sp_po_batch[sp_indexes, 1]
-            )
-            loss_value = loss_value + self.loss(scores_sp, labels[sp_indexes,])
-        if len(po_indexes) > 0:
-            scores_po = self.model.score_po(
-                sp_po_batch[po_indexes, 0], sp_po_batch[po_indexes, 1]
-            )
-            loss_value = loss_value + self.loss(scores_po, labels[po_indexes,])
-        batch_forward_time += time.time()
+        prepare_time += time.time()
 
-        return loss_value, batch_size, batch_prepare_time, batch_forward_time
+        # forward/backward pass (sp)
+        loss_value_total = 0.0
+        backward_time = 0
+        forward_time = 0
+        for query_type, examples in examples_for_query_type.items():
+            if len(examples) > 0:
+                forward_time -= time.time()
+                if query_type == "sp_":
+                    scores = self.model.score_sp(
+                        queries_batch[examples, 0], queries_batch[examples, 1]
+                    )
+                elif query_type == "s_o":
+                    scores = self.model.score_so(
+                        queries_batch[examples, 0], queries_batch[examples, 1]
+                    )
+                else:
+                    scores = self.model.score_po(
+                        queries_batch[examples, 0], queries_batch[examples, 1]
+                    )
+                loss_value = (
+                    self.loss(scores, labels_for_query_type[query_type]) / batch_size
+                )
+                loss_value_total = loss_value.item()
+                forward_time += time.time()
+                backward_time -= time.time()
+                loss_value.backward()
+                backward_time += time.time()
+
+        # all done
+        return TrainingJob._ProcessBatchResult(
+            loss_value_total, batch_size, prepare_time, forward_time, backward_time
+        )
 
 
 class TrainingJobNegativeSampling(TrainingJob):
     def __init__(self, config, dataset, parent_job=None):
         super().__init__(config, dataset, parent_job)
-        self._sampler = KgeNegativeSampler.create(config, "negative_sampling", dataset)
+        self._sampler = KgeSampler.create(config, "negative_sampling", dataset)
         self.is_prepared = False
-        self._implementation = self.config.get("negative_sampling.implementation")
+        self._implementation = self.config.check(
+            "negative_sampling.implementation", ["triple", "all", "batch", "auto"],
+        )
         if self._implementation == "auto":
-            max_nr_of_negs = max(self._sampler.num_negatives.values())
-            if max_nr_of_negs <= 30:
-                self._implementation = "spo"
+            max_nr_of_negs = max(self._sampler.num_samples)
+            if self._sampler.shared:
+                self._implementation = "batch"
+            elif max_nr_of_negs <= 30:
+                self._implementation = "triple"
             elif max_nr_of_negs > 30:
-                self._implementation = "sp_po"
+                self._implementation = "batch"
+        self._max_chunk_size = self.config.get("negative_sampling.chunk_size")
 
         config.log(
             "Initializing negative sampling training job with "
@@ -672,15 +810,16 @@ class TrainingJobNegativeSampling(TrainingJob):
         if self.is_prepared:
             return
 
+        self.num_examples = self.dataset.split(self.train_split).size(0)
         self.loader = torch.utils.data.DataLoader(
-            range(self.dataset.train.size(0)),
+            range(self.num_examples),
             collate_fn=self._get_collate_fun(),
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.config.get("train.num_workers"),
+            worker_init_fn=_generate_worker_init_fn(self.config),
             pin_memory=self.config.get("train.pin_memory"),
         )
-        self.num_examples = self.dataset.train.size(0)
 
         self.is_prepared = True
 
@@ -690,11 +829,11 @@ class TrainingJobNegativeSampling(TrainingJob):
             """For a batch of size n, returns a tuple of:
 
             - triples (tensor of shape [n,3], ),
-            - negative_samples (list of tensors of shape [n,num_negatives]; 3 elements
+            - negative_samples (list of tensors of shape [n,num_samples]; 3 elements
               in order S,P,O)
             """
 
-            triples = self.dataset.train[batch, :].long()
+            triples = self.dataset.split(self.train_split)[batch, :].long()
             # labels = torch.zeros((len(batch), self._sampler.num_negatives_total + 1))
             # labels[:, 0] = 1
             # labels = labels.view(-1)
@@ -706,160 +845,187 @@ class TrainingJobNegativeSampling(TrainingJob):
 
         return collate
 
-    def _compute_batch_loss(self, batch_index, batch):
+    def _process_batch(self, batch_index, batch) -> TrainingJob._ProcessBatchResult:
         # prepare
-        batch_prepare_time = -time.time()
-        triples = batch["triples"].to(self.device)
-        negative_samples = [ns.to(self.device) for ns in batch["negative_samples"]]
-        batch_size = len(triples)
-        batch_prepare_time += time.time()
+        prepare_time = -time.time()
+        batch_triples = batch["triples"].to(self.device)
+        batch_negative_samples = [
+            ns.to(self.device) for ns in batch["negative_samples"]
+        ]
+        batch_size = len(batch_triples)
+        prepare_time += time.time()
 
-        # forward pass
-        batch_forward_time = -time.time()
+        loss_value = 0.0
+        forward_time = 0.0
+        backward_time = 0.0
+        labels = None
 
-        loss_value = torch.zeros(1, device=self.device)
+        # perform processing of batch in smaller chunks to save memory
+        max_chunk_size = (
+            self._max_chunk_size if self._max_chunk_size > 0 else batch_size
+        )
+        for chunk_number in range(math.ceil(batch_size / max_chunk_size)):
+            # determine data used for this chunk
+            chunk_start = max_chunk_size * chunk_number
+            chunk_end = min(max_chunk_size * (chunk_number + 1), batch_size)
+            negative_samples = [
+                ns[chunk_start:chunk_end, :] for ns in batch_negative_samples
+            ]
+            triples = batch_triples[chunk_start:chunk_end, :]
+            chunk_size = chunk_end - chunk_start
 
-        if self._implementation == "spo":
-            # one call to spo
-            labels = torch.zeros(
-                (batch_size, self._sampler.num_negatives_total + 1), device=self.device
-            )
-            labels[:, 0] = 1
-
-            triples_input = triples.repeat(
-                1, 1 + self._sampler.num_negatives_total
-            ).view(-1, 3)
-            offset = 0
+            # process the chunk
             for slot in [S, P, O]:
-                if self._sampler.num_negatives[slot] > 0:
-                    triples_input[
-                        list(
-                            itertools.chain(
-                                *map(
-                                    lambda x: range(
-                                        x + 1, x + self._sampler.num_negatives[slot] + 1
-                                    ),
-                                    range(
-                                        offset,
-                                        triples_input.size(0),
-                                        1 + self._sampler.num_negatives_total,
-                                    ),
-                                )
-                            )
+                num_samples = self._sampler.num_samples[slot]
+                if num_samples <= 0:
+                    continue
+
+                # construct gold labels: first column corresponds to positives,
+                # remaining columns to negatives
+                if labels is None or labels.shape != torch.Size(
+                    [chunk_size, 1 + num_samples]
+                ):
+                    prepare_time -= time.time()
+                    labels = torch.zeros(
+                        (chunk_size, 1 + num_samples), device=self.device
+                    )
+                    labels[:, 0] = 1
+                    prepare_time += time.time()
+
+                # compute corresponding scores
+                scores = None
+                if self._implementation == "triple":
+                    # construct triples
+                    prepare_time -= time.time()
+                    triples_to_score = triples.repeat(1, 1 + num_samples).view(-1, 3)
+                    triples_to_score[:, slot] = torch.cat(
+                        (
+                            triples[:, [slot]],  # positives
+                            negative_samples[slot],  # negatives
                         ),
-                        ([slot] * self._sampler.num_negatives[slot]) * batch_size,
-                    ] = negative_samples[slot].view(-1)
-                    offset += self._sampler.num_negatives[slot]
+                        1,
+                    ).view(-1)
+                    prepare_time += time.time()
 
-            scores = self.model.score_spo(
-                triples_input[:, 0], triples_input[:, 1], triples_input[:, 2]
-            ).view(batch_size, -1)
+                    # and score them
+                    forward_time -= time.time()
+                    scores = self.model.score_spo(
+                        triples_to_score[:, 0],
+                        triples_to_score[:, 1],
+                        triples_to_score[:, 2],
+                        direction="s" if slot == S else ("o" if slot == O else "p"),
+                    ).view(chunk_size, -1)
+                    forward_time += time.time()
+                elif self._implementation == "all":
+                    # Score against all possible targets. Creates a score matrix of size
+                    # [chunk_size, num_entities] or [chunk_size, num_relations]. All
+                    # scores relevant for positive and negative triples are contained in
+                    # this score matrix.
 
-            loss_value = self.loss(
-                scores, labels, num_negatives=self._sampler.num_negatives_total
-            )
-        elif self._implementation == "sp_po_loop":
-            # one call to sp_po per example
-            labels = torch.zeros(
-                (batch_size, self._sampler.num_negatives_total + 1), device=self.device
-            )
-            labels[:, 0] = 1
+                    # compute all scores for slot
+                    forward_time -= time.time()
+                    if slot == S:
+                        all_scores = self.model.score_po(triples[:, P], triples[:, O])
+                    elif slot == P:
+                        all_scores = self.model.score_so(triples[:, S], triples[:, O])
+                    elif slot == O:
+                        all_scores = self.model.score_sp(triples[:, S], triples[:, P])
+                    else:
+                        raise NotImplementedError
+                    forward_time += time.time()
 
-            scores = torch.zeros(
-                (batch_size, self._sampler.num_negatives_total + 1), device=self.device
-            )
+                    # determine indexes of relevant scores in scoring matrix
+                    prepare_time -= time.time()
+                    row_indexes = (
+                        torch.arange(chunk_size, device=self.device)
+                        .unsqueeze(1)
+                        .repeat(1, 1 + num_samples)
+                        .view(-1)
+                    )  # 000 111 222; each 1+num_negative times (here: 3)
+                    column_indexes = torch.cat(
+                        (
+                            triples[:, [slot]],  # positives
+                            negative_samples[slot],  # negatives
+                        ),
+                        1,
+                    ).view(-1)
+                    prepare_time += time.time()
 
-            # positives
-            scores[:, 0] = self.model.score_spo(
-                triples[:, 0], triples[:, 1], triples[:, 2]
-            ).view(-1)
-
-            # subject samples
-            o, n = 1, self._sampler.num_negatives[S]
-            if n > 0:
-                for i in range(batch_size):
-                    scores[i, o : (o + n)] = self.model.score_po(
-                        triples[i, P].view(1, 1),
-                        triples[i, O].view(1, 1),
-                        negative_samples[S][i, :],
+                    # now pick the scores we need
+                    forward_time -= time.time()
+                    scores = all_scores[row_indexes, column_indexes].view(
+                        chunk_size, -1
+                    )
+                    forward_time += time.time()
+                elif self._implementation == "batch":
+                    # Score against all targets contained in the chunk. Creates a score
+                    # matrix of size [chunk_size, unique_entities_in_slot] or
+                    # [chunk_size, unique_relations_in_slot]. All scores
+                    # relevant for positive and negative triples are contained in this
+                    # score matrix.
+                    forward_time -= time.time()
+                    unique_targets, column_indexes = torch.unique(
+                        torch.cat((triples[:, [slot]], negative_samples[slot]), 1).view(
+                            -1
+                        ),
+                        return_inverse=True,
                     )
 
-            # predicate samples
-            o += n
-            n = self._sampler.num_negatives[P]
-            if n > 0:
-                raise NotImplementedError
+                    # compute scores for all unique targets for slot
+                    if slot == S:
+                        all_scores = self.model.score_po(
+                            triples[:, P], triples[:, O], unique_targets
+                        )
+                    elif slot == P:
+                        all_scores = self.model.score_so(
+                            triples[:, S], triples[:, O], unique_targets
+                        )
+                    elif slot == O:
+                        all_scores = self.model.score_sp(
+                            triples[:, S], triples[:, P], unique_targets
+                        )
+                    else:
+                        raise NotImplementedError
+                    forward_time += time.time()
 
-            # object samples
-            o += n
-            n = self._sampler.num_negatives[O]
-            if n > 0:
-                for i in range(batch_size):
-                    scores[i, o : (o + n)] = self.model.score_sp(
-                        triples[i, S].view(1, 1),
-                        triples[i, P].view(1, 1),
-                        negative_samples[O][i, :],
+                    # determine indexes of relevant scores in scoring matrix
+                    prepare_time -= time.time()
+                    row_indexes = (
+                        torch.arange(chunk_size, device=self.device)
+                        .unsqueeze(1)
+                        .repeat(1, 1 + num_samples)
+                        .view(-1)
+                    )  # 000 111 222; each 1+num_negative times (here: 3)
+                    prepare_time += time.time()
+
+                    # now pick the scores we need
+                    forward_time -= time.time()
+                    scores = all_scores[row_indexes, column_indexes].view(
+                        chunk_size, -1
                     )
+                    forward_time += time.time()
 
-            loss_value = self.loss(
-                scores, labels, num_negatives=self._sampler.num_negatives_total
-            )
-
-        elif self._implementation == "sp_po":
-
-            for score_fn, target_slot, slot_1, slot_2 in [
-                (self.model.score_sp, O, S, P),
-                (self.model.score_po, S, P, O),
-            ]:
-
-                num_negatives = self._sampler.num_negatives[target_slot]
-
-                labels = torch.zeros(
-                    (batch_size, num_negatives + 1), device=self.device
+                # compute chunk loss (concluding the forward pass of the chunk)
+                forward_time -= time.time()
+                loss_value_torch = (
+                    self.loss(scores, labels, num_negatives=num_samples) / batch_size
                 )
-                labels[:, 0] = 1
-                labels = labels.view(-1)
+                loss_value += loss_value_torch.item()
+                forward_time += time.time()
 
-                slot_scores = score_fn(triples[:, slot_1], triples[:, slot_2])
-                target_labels = triples[:, target_slot]
+                # backward pass for this chunk
+                backward_time -= time.time()
+                loss_value_torch.backward()
+                backward_time += time.time()
 
-                target_labels_coords = target_labels.view(-1, 1).repeat(1, 2)
-                target_labels_coords[:, 0] = torch.arange(0, target_labels.size(0))
-                label_coords_pick = target_labels_coords.repeat(1, 1 + num_negatives)
-
-                label_coords_pick[
-                    torch.arange(0, target_labels_coords.size(0))
-                    .repeat(num_negatives, 1)
-                    .t()
-                    .contiguous()
-                    .view(-1),
-                    torch.arange(3, (num_negatives + 1) * 2, 2)
-                    .repeat(target_labels_coords.size(0), 1)
-                    .view(-1),
-                ] = negative_samples[target_slot].view(-1)
-
-                label_coords_pick = label_coords_pick.view(-1, 2)
-
-                loss_value = loss_value + self.loss(
-                    slot_scores[label_coords_pick[:, 0], label_coords_pick[:, 1]].view(
-                        batch_size, -1
-                    ),
-                    labels.view(batch_size, -1),
-                    num_negatives=num_negatives,
-                )
-        else:
-            raise ValueError("implementation")
-
-        batch_forward_time += time.time()
-
-        return loss_value, batch_size, batch_prepare_time, batch_forward_time
+        # all done
+        return TrainingJob._ProcessBatchResult(
+            loss_value, batch_size, prepare_time, forward_time, backward_time
+        )
 
 
 class TrainingJob1vsAll(TrainingJob):
-    """Samples SPO pairs and queries sp* and *po, treating all other entities as negative.
-
-    Currently only works with ce loss.
-    """
+    """Samples SPO pairs and queries sp_ and _po, treating all other entities as negative."""
 
     def __init__(self, config, dataset, parent_job=None):
         super().__init__(config, dataset, parent_job)
@@ -877,31 +1043,49 @@ class TrainingJob1vsAll(TrainingJob):
         if self.is_prepared:
             return
 
+        self.num_examples = self.dataset.split(self.train_split).size(0)
         self.loader = torch.utils.data.DataLoader(
-            range(self.dataset.train.size(0)),
-            collate_fn=lambda batch: {"triples": self.dataset.train[batch, :].long()},
+            range(self.num_examples),
+            collate_fn=lambda batch: {
+                "triples": self.dataset.split(self.train_split)[batch, :].long()
+            },
             shuffle=True,
             batch_size=self.batch_size,
             num_workers=self.config.get("train.num_workers"),
+            worker_init_fn=_generate_worker_init_fn(self.config),
             pin_memory=self.config.get("train.pin_memory"),
         )
-        self.num_examples = self.dataset.train.size(0)
 
         self.is_prepared = True
 
-    def _compute_batch_loss(self, batch_index, batch):
+    def _process_batch(self, batch_index, batch) -> TrainingJob._ProcessBatchResult:
         # prepare
-        batch_prepare_time = -time.time()
+        prepare_time = -time.time()
         triples = batch["triples"].to(self.device)
         batch_size = len(triples)
-        batch_prepare_time += time.time()
+        prepare_time += time.time()
 
-        # forward pass
-        batch_forward_time = -time.time()
+        # forward/backward pass (sp)
+        forward_time = -time.time()
         scores_sp = self.model.score_sp(triples[:, 0], triples[:, 1])
-        loss_value = self.loss(scores_sp, triples[:, 2])
-        scores_po = self.model.score_po(triples[:, 1], triples[:, 2])
-        loss_value = loss_value + self.loss(scores_po, triples[:, 0])
-        batch_forward_time += time.time()
+        loss_value_sp = self.loss(scores_sp, triples[:, 2]) / batch_size
+        loss_value = loss_value_sp.item()
+        forward_time += time.time()
+        backward_time = -time.time()
+        loss_value_sp.backward()
+        backward_time += time.time()
 
-        return loss_value, batch_size, batch_prepare_time, batch_forward_time
+        # forward/backward pass (po)
+        forward_time -= time.time()
+        scores_po = self.model.score_po(triples[:, 1], triples[:, 2])
+        loss_value_po = self.loss(scores_po, triples[:, 0]) / batch_size
+        loss_value += loss_value_po.item()
+        forward_time += time.time()
+        backward_time -= time.time()
+        loss_value_po.backward()
+        backward_time += time.time()
+
+        # all done
+        return TrainingJob._ProcessBatchResult(
+            loss_value, batch_size, prepare_time, forward_time, backward_time
+        )

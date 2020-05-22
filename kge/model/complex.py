@@ -34,12 +34,12 @@ class ComplExScorer(RelationalScorer):
 
         if combine == "spo":
             out = (s_all * o_all * r_all).sum(dim=1)
-        elif combine == "sp*":
+        elif combine == "sp_":
             out = (s_all * r_all).mm(o_all.transpose(0, 1))
-        elif combine == "*po":
+        elif combine == "_po":
             out = (r_all * o_all).mm(s_all.transpose(0, 1))
         else:
-            raise ValueError('cannot handle combine="{}".format(combine)')
+            return super().score_emb(s_emb, p_emb, o_emb, combine)
 
         return out.view(n, -1)
 

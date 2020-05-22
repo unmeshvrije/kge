@@ -4,12 +4,11 @@ import datetime
 import os
 import time
 import uuid
+import sys
 from enum import Enum
 
 import yaml
 from typing import Any, Dict, List, Optional, Union
-
-from kge.util.misc import filename_in_module, is_number
 
 
 class Config:
@@ -19,17 +18,21 @@ class Config:
     :file:`config_default.yaml`.
     """
 
-    def __init__(self, folder: str = None, load_default=True):
+    def __init__(self, folder: Optional[str] = None, load_default=True):
         """Initialize with the default configuration"""
         if load_default:
             import kge
+            from kge.misc import filename_in_module
 
             with open(filename_in_module(kge, "config-default.yaml"), "r") as file:
                 self.options: Dict[str, Any] = yaml.load(file, Loader=yaml.SafeLoader)
         else:
             self.options = {}
 
-        self.folder = folder
+        self.folder = folder  # main folder (config file, checkpoints, ...)
+        self.log_folder: Optional[str] = (
+            None  # None means use self.folder; used for kge.log, trace.yaml
+        )
         self.log_prefix: str = None
 
     # -- ACCESS METHODS ----------------------------------------------------------------
@@ -43,7 +46,10 @@ class Config:
         """
         result = self.options
         for name in key.split("."):
-            result = result[name]
+            try:
+                result = result[name]
+            except KeyError:
+                raise KeyError(f"Error accessing {name} for key {key}")
 
         if remove_plusplusplus and isinstance(result, collections.Mapping):
 
@@ -139,6 +145,8 @@ class Config:
         into the configuration.
 
         """
+        from kge.misc import is_number
+
         splits = key.split(".")
         data = self.options
 
@@ -151,12 +159,17 @@ class Config:
                 if create:
                     data[splits[i]] = dict()
                 else:
-                    raise KeyError(
-                        (
-                            "{} cannot be set because creation of "
-                            + "{} is not permitted"
-                        ).format(key, ".".join(splits[: (i + 1)]))
-                    )
+                    msg = (
+                        "Key '{}' cannot be set because key '{}' does not exist "
+                        "and no new keys are allowed to be created "
+                    ).format(key, ".".join(splits[: (i + 1)]))
+                    if i == 0:
+                        raise KeyError(msg + "at root level.")
+                    else:
+                        raise KeyError(
+                            msg + "under key '{}'.".format(".".join(splits[:i]))
+                        )
+
             path.append(splits[i])
             data = data[splits[i]]
 
@@ -170,7 +183,14 @@ class Config:
 
         if current_value is None:
             if not create:
-                raise ValueError("key {} not present".format(key))
+                msg = (
+                    f"Key '{key}' cannot be set because it does not exist and "
+                    "no new keys are allowed to be created "
+                )
+                if len(path) == 0:
+                    raise KeyError(msg + "at root level.")
+                else:
+                    raise KeyError(msg + ("under key '{}'.").format(".".join(path)))
 
             if isinstance(value, str) and is_number(value, int):
                 value = int(value)
@@ -191,14 +211,14 @@ class Config:
                 value = int(value)
             if type(value) != type(current_value):
                 raise ValueError(
-                    "key {} has incorrect type (expected {}, found {})".format(
+                    "key '{}' has incorrect type (expected {}, found {})".format(
                         key, type(current_value), type(value)
                     )
                 )
             if overwrite == Config.Overwrite.No:
                 return current_value
             if overwrite == Config.Overwrite.Error and value != current_value:
-                raise ValueError("key {} cannot be overwritten".format(key))
+                raise ValueError("key '{}' cannot be overwritten".format(key))
 
         # all fine, set value
         data[splits[-1]] = value
@@ -214,13 +234,14 @@ class Config:
         that fields and their types are correct.
 
         """
-        import kge.model, kge.model.experimental
+        import kge.model, kge.model.embedder
+        from kge.misc import filename_in_module
 
         # load the module_name
         module_config = Config(load_default=False)
         module_config.load(
             filename_in_module(
-                [kge.model, kge.model.experimental], "{}.yaml".format(module_name)
+                [kge.model, kge.model.embedder], "{}.yaml".format(module_name)
             ),
             create=True,
         )
@@ -277,7 +298,17 @@ class Config:
         """
         with open(filename, "r") as file:
             new_options = yaml.load(file, Loader=yaml.SafeLoader)
+        self.load_options(
+            new_options,
+            create=create,
+            overwrite=overwrite,
+            allow_deprecated=allow_deprecated,
+        )
 
+    def load_options(
+        self, new_options, create=False, overwrite=Overwrite.Yes, allow_deprecated=True
+    ):
+        "Like `load`, but loads from an options object obtained from `yaml.load`."
         # import model configurations
         if "model" in new_options:
             model = new_options.get("model")
@@ -394,6 +425,8 @@ class Config:
 
     def checkpoint_file(self, cpt_id: Union[str, int]) -> str:
         "Return path of checkpoint file for given checkpoint id"
+        from kge.misc import is_number
+
         if is_number(cpt_id, int):
             return os.path.join(self.folder, "checkpoint_{:05d}.pt".format(int(cpt_id)))
         else:
@@ -412,6 +445,19 @@ class Config:
             return found_epoch
         else:
             return None
+
+    @staticmethod
+    def get_best_or_last_checkpoint(path: str) -> str:
+        """Return best (if present) or last checkpoint path for a given folder path."""
+        config = Config(folder=path, load_default=False)
+        checkpoint_file = config.checkpoint_file("best")
+        if os.path.isfile(checkpoint_file):
+            return checkpoint_file
+        cpt_epoch = config.last_checkpoint()
+        if cpt_epoch:
+            return config.checkpoint_file(cpt_epoch)
+        else:
+            raise Exception("Could not find checkpoint in {}".format(path))
 
     # -- CONVENIENCE METHODS --------------------------------------------------
 
@@ -461,10 +507,18 @@ class Config:
         return value
 
     def logfile(self) -> str:
-        return os.path.join(self.folder, "kge.log")
+        folder = self.log_folder if self.log_folder else self.folder
+        if folder:
+            return os.path.join(folder, "kge.log")
+        else:
+            return os.devnull
 
     def tracefile(self) -> str:
-        return os.path.join(self.folder, "trace.yaml")
+        folder = self.log_folder if self.log_folder else self.folder
+        if folder:
+            return os.path.join(folder, "trace.yaml")
+        else:
+            return os.devnull
 
 
 class Configurable:
@@ -477,6 +531,13 @@ class Configurable:
 
     def __init__(self, config: Config, configuration_key: str = None):
         self._init_configuration(config, configuration_key)
+
+    def has_option(self, name: str) -> bool:
+        try:
+            self.get_option(name)
+            return True
+        except KeyError:
+            return False
 
     def get_option(self, name: str) -> Any:
         if self.configuration_key:
@@ -523,11 +584,16 @@ class Configurable:
 
 
 def _process_deprecated_options(options: Dict[str, Any]):
+    import re
+
     # renames given key (but not subkeys!)
     def rename_key(old_key, new_key):
         if old_key in options:
             print(
-                "Warning: key {} is deprecated; use {} instead".format(old_key, new_key)
+                "Warning: key {} is deprecated; use key {} instead".format(
+                    old_key, new_key
+                ),
+                file=sys.stderr,
             )
             if new_key in options:
                 raise ValueError(
@@ -536,26 +602,94 @@ def _process_deprecated_options(options: Dict[str, Any]):
             value = options[old_key]
             del options[old_key]
             options[new_key] = value
+            return True
+        return False
 
     # renames a value
     def rename_value(key, old_value, new_value):
         if key in options and options.get(key) == old_value:
             print(
-                "Warning: {}={} is deprecated; use {} instead".format(
-                    key, old_value, new_value
-                )
+                "Warning: value {}={} is deprecated; use value {} instead".format(
+                    key, old_value, new_value if new_value != "" else "''"
+                ),
+                file=sys.stderr,
             )
             options[key] = new_value
+            return True
+        return False
 
     # renames a set of keys matching a regular expression
     def rename_keys_re(key_regex, replacement):
-        import re
-
+        renamed_keys = set()
         regex = re.compile(key_regex)
         for old_key in options.keys():
             new_key = regex.sub(replacement, old_key)
             if old_key != new_key:
                 rename_key(old_key, new_key)
+                renamed_keys.add(new_key)
+        return renamed_keys
+
+    # renames a value of keys matching a regular expression
+    def rename_value_re(key_regex, old_value, new_value):
+        renamed_keys = set()
+        regex = re.compile(key_regex)
+        for key in options.keys():
+            if regex.match(key):
+                if rename_value(key, old_value, new_value):
+                    renamed_keys.add(key)
+        return renamed_keys
+
+    # 18.03.2020
+    rename_value("train.lr_scheduler", "ConstantLRScheduler", "")
+
+    # 16.03.2020
+    rename_key("eval.data", "eval.split")
+    rename_key("valid.filter_with_test", "eval.filter_with_test")
+
+    # 26.02.2020
+    rename_value("negative_sampling.implementation", "spo", "triple")
+    rename_value("negative_sampling.implementation", "sp_po", "batch")
+
+    # 31.01.2020
+    rename_key("negative_sampling.num_samples_s", "negative_sampling.num_samples.s")
+    rename_key("negative_sampling.num_samples_p", "negative_sampling.num_samples.p")
+    rename_key("negative_sampling.num_samples_o", "negative_sampling.num_samples.o")
+
+    # 10.01.2020
+    rename_key("negative_sampling.filter_positives_s", "negative_sampling.filtering.s")
+    rename_key("negative_sampling.filter_positives_p", "negative_sampling.filtering.p")
+    rename_key("negative_sampling.filter_positives_o", "negative_sampling.filtering.o")
+
+    # 20.12.2019
+    for split in ["train", "valid", "test"]:
+        old_key = f"dataset.{split}"
+        if old_key in options:
+            rename_key(old_key, f"dataset.files.{split}.filename")
+            options[f"dataset.files.{split}.type"] = "triples"
+    for obj in ["entity", "relation"]:
+        old_key = f"dataset.{obj}_map"
+        if old_key in options:
+            rename_key(old_key, f"dataset.files.{obj}_ids.filename")
+            options[f"dataset.files.{obj}_ids.type"] = "map"
+
+    # 14.12.2019
+    rename_key("negative_sampling.filter_true_s", "negative_sampling.filtering.s")
+    rename_key("negative_sampling.filter_true_p", "negative_sampling.filtering.p")
+    rename_key("negative_sampling.filter_true_o", "negative_sampling.filtering.o")
+
+    # 14.12.2019
+    rename_key("negative_sampling.num_negatives_s", "negative_sampling.num_samples.s")
+    rename_key("negative_sampling.num_negatives_p", "negative_sampling.num_samples.p")
+    rename_key("negative_sampling.num_negatives_o", "negative_sampling.num_samples.o")
+
+    # 30.10.2019
+    rename_value("train.loss", "ce", "kl")
+    rename_keys_re(r"\.regularize_args\.weight$", ".regularize_weight")
+    for p in [1, 2, 3]:
+        for key in rename_value_re(r".*\.regularize$", f"l{p}", "lp"):
+            new_key = re.sub(r"\.regularize$", ".regularize_args.p", key)
+            options[new_key] = p
+            print(f"Set {new_key}={p}.", file=sys.stderr)
 
     # 21.10.2019
     rename_key("negative_sampling.score_func_type", "negative_sampling.implementation")
@@ -575,5 +709,4 @@ def _process_deprecated_options(options: Dict[str, Any]):
     rename_key(
         "eval.metric_per_argument_frequency_perc", "eval.metrics_per.argument_frequency"
     )
-
     return options

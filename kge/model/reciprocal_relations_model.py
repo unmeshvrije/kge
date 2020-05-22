@@ -1,4 +1,5 @@
 import torch
+from torch import Tensor
 from kge import Config, Dataset
 from kge.model.kge_model import KgeModel
 
@@ -7,8 +8,8 @@ class ReciprocalRelationsModel(KgeModel):
     """Modifies a base model to use different relation embeddings for predicting subject and object.
 
     This implements the reciprocal relations training procedure of [TODO cite ConvE].
-    Note that this model cannot be used to score a single triple, but only to rank sp*
-    or *po questions.
+    Note that this model cannot be used to score a single triple, but only to rank sp_
+    or _po questions.
 
     """
 
@@ -17,19 +18,8 @@ class ReciprocalRelationsModel(KgeModel):
 
         # Initialize base model
         # Using a dataset with twice the number of relations to initialize base model
-        alt_dataset = Dataset(
-            dataset.config,
-            dataset.num_entities,
-            dataset.entities,
-            dataset.num_relations * 2,
-            dataset.relations,
-            dataset.train,
-            dataset.train_meta,
-            dataset.valid,
-            dataset.valid_meta,
-            dataset.test,
-            dataset.test_meta,
-        )
+        alt_dataset = dataset.shallow_copy()
+        alt_dataset._num_relations = dataset.num_relations() * 2
         base_model = KgeModel.create(
             config, alt_dataset, self.configuration_key + ".base_model"
         )
@@ -50,30 +40,54 @@ class ReciprocalRelationsModel(KgeModel):
     def penalty(self, **kwargs):
         return super().penalty(**kwargs) + self._base_model.penalty(**kwargs)
 
-    def score_spo(self, s, p, o):
-        raise Exception("The reciprocal relations model cannot compute spo scores.")
+    def score_spo(self, s: Tensor, p: Tensor, o: Tensor, direction=None) -> Tensor:
+        if direction == "o":
+            return super().score_spo(s, p, o, "o")
+        elif direction == "s":
+            return super().score_spo(o, p + self.dataset.num_relations(), s, "o")
+        else:
+            raise Exception(
+                "The reciprocal relations model cannot compute "
+                "undirected spo scores."
+            )
 
     def score_po(self, p, o, s=None):
         if s is None:
             s = self.get_s_embedder().embed_all()
         else:
             s = self.get_s_embedder().embed(s)
-        p = self.get_p_embedder().embed(p + self.dataset.num_relations)
+        p = self.get_p_embedder().embed(p + self.dataset.num_relations())
         o = self.get_o_embedder().embed(o)
-        return self._scorer.score_emb(o, p, s, combine="sp*")
+        return self._scorer.score_emb(o, p, s, combine="sp_")
 
-    def score_sp_po(self, s, p, o):
+    def score_so(self, s, o, p=None):
+        raise Exception("The reciprocal relations model cannot score relations.")
+
+    def score_sp_po(
+        self,
+        s: torch.Tensor,
+        p: torch.Tensor,
+        o: torch.Tensor,
+        entity_subset: torch.Tensor = None,
+    ) -> torch.Tensor:
         s = self.get_s_embedder().embed(s)
-        p_inv = self.get_p_embedder().embed(p + self.dataset.num_relations)
+        p_inv = self.get_p_embedder().embed(p + self.dataset.num_relations())
         p = self.get_p_embedder().embed(p)
         o = self.get_o_embedder().embed(o)
         if self.get_s_embedder() is self.get_o_embedder():
-            all_entities = self.get_s_embedder().embed_all()
-            sp_scores = self._scorer.score_emb(s, p, all_entities, combine="sp*")
-            po_scores = self._scorer.score_emb(o, p_inv, all_entities, combine="sp*")
+            if entity_subset is not None:
+                all_entities = self.get_s_embedder().embed(entity_subset)
+            else:
+                all_entities = self.get_s_embedder().embed_all()
+            sp_scores = self._scorer.score_emb(s, p, all_entities, combine="sp_")
+            po_scores = self._scorer.score_emb(o, p_inv, all_entities, combine="sp_")
         else:
-            all_objects = self.get_o_embedder().embed_all()
-            sp_scores = self._scorer.score_emb(s, p, all_objects, combine="sp*")
-            all_subjects = self.get_s_embedder().embed_all()
-            po_scores = self._scorer.score_emb(o, p_inv, all_subjects, combine="sp*")
+            if entity_subset is not None:
+                all_objects = self.get_o_embedder().embed(entity_subset)
+                all_subjects = self.get_s_embedder().embed(entity_subset)
+            else:
+                all_objects = self.get_o_embedder().embed_all()
+                all_subjects = self.get_s_embedder().embed_all()
+            sp_scores = self._scorer.score_emb(s, p, all_objects, combine="sp_")
+            po_scores = self._scorer.score_emb(o, p_inv, all_subjects, combine="sp_")
         return torch.cat((sp_scores, po_scores), dim=1)

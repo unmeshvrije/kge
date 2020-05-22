@@ -37,14 +37,15 @@ class AxSearchJob(AutoSearchJob):
                 steps=[
                     GenerationStep(
                         model=Models.SOBOL,
-                        num_arms=self.num_sobol_trials,
-                        min_arms_observed=ceil(self.num_sobol_trials / 2),
-                        enforce_num_arms=True,
+                        num_trials=self.num_sobol_trials,
+                        min_trials_observed=ceil(self.num_sobol_trials / 2),
+                        enforce_num_trials=True,
+                        model_kwargs={"seed": self.config.get("ax_search.sobol_seed")},
                     ),
                     GenerationStep(
                         model=Models.GPEI,
-                        num_arms=-1,
-                        recommended_max_parallelism=3,
+                        num_trials=-1,
+                        max_parallelism=3,
                         model_gen_kwargs={
                             "fixed_features": ObservationFeatures(
                                 parameters={
@@ -61,14 +62,21 @@ class AxSearchJob(AutoSearchJob):
             # END: from /ax/service/utils/dispatch.py
 
             self.ax_client = AxClient(generation_strategy=generation_strategy)
+            choose_generation_strategy_kwargs=dict()
         else:
             self.ax_client = AxClient()
+            # set random_seed that will be used by auto created sobol search from ax
+            # note that here the argument is called "random_seed" not "seed"
+            choose_generation_strategy_kwargs={
+                "random_seed": self.config.get("ax_search.sobol_seed")
+            }
         self.ax_client.create_experiment(
             name=self.job_id,
             parameters=self.config.get("ax_search.parameters"),
             objective_name="metric_value",
             minimize=False,
             parameter_constraints=self.config.get("ax_search.parameter_constraints"),
+            choose_generation_strategy_kwargs=choose_generation_strategy_kwargs,
         )
         self.config.log(
             "ax search initialized with {}".format(self.ax_client.generation_strategy)
@@ -76,10 +84,9 @@ class AxSearchJob(AutoSearchJob):
 
         # Make sure sobol models are resumed correctly
         if self.ax_client.generation_strategy._curr.model == Models.SOBOL:
-            # Fix seed for sobol. We do this by generating the model right away (instead
-            # of automatically once first trial is generated).
+
             self.ax_client.generation_strategy._set_current_model(
-                experiment=self.ax_client.experiment, data=None, seed=0
+                experiment=self.ax_client.experiment, data=None
             )
 
             # Regenerate and drop SOBOL arms already generated. Since we fixed the seed,
