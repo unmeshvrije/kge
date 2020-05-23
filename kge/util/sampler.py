@@ -351,11 +351,32 @@ class KgeFrequencySampler(KgeSampler):
         return result
 
 
-class TripleClassificationSampler(KgeSampler):
-    def __init__(self, config, configuration_key, dataset):
-        super().__init__(config, configuration_key, dataset)
+class TripleClassificationSampler(Configurable):
+    def __init__(self, config: Config, configuration_key: str, dataset: Dataset):
+        super().__init__(config, configuration_key)
+        self.dataset = dataset
+        self._is_prepared = False
+        self.train_data = None
+        self.s_entities = None
+        self.o_entities = None
+        uni_sampler_config = config.clone()
+        # uni_sampler_config.set("negative_sampling.num_samples.s", self.get_option("num_samples.s"))
+        uni_sampler_config.set("negative_sampling.num_samples.s", 1)
+        uni_sampler_config.set("negative_sampling.filtering.s", True)
+        # uni_sampler_config.set("negative_sampling.num_samples.o", self.get_option("num_samples.o"))
+        uni_sampler_config.set("negative_sampling.num_samples.o", 1)
+        uni_sampler_config.set("negative_sampling.filtering.o", True)
+        self.uniform_sampler = KgeUniformSampler(
+            uni_sampler_config, "negative_sampling", dataset
+        )
 
-    def _sample(self, positive_triples: torch.Tensor, slot: int, num_samples: int):
+    def _prepare(self,):
+        train_data = self.dataset.split("train")
+        self.s_entities = train_data[:, S].unique().numpy()
+        self.o_entities = train_data[:, O].unique().numpy()
+        self._is_prepared = True
+
+    def sample(self, positive_triples: torch.Tensor):
         """Generates dataset with positive and negative triples.
 
         Takes each triple of the specified dataset and randomly replaces either the
@@ -372,29 +393,25 @@ class TripleClassificationSampler(KgeSampler):
                         dataset: {1: [1, 0, 1, 0]}
         """
 
-        # Create objects for the corrupted dataset and the corresponding labels
-        corrupted = dataset.repeat(1, 2).view(-1, 3)
-        labels = torch.as_tensor([1, 0] * len(dataset)).to(self.device)
+        if not self._is_prepared:
+            self._prepare()
 
-        # The sampling influences the results in the end. To compare models or parameters, the seeds should be fixed
-        if self.config.get("eval.triple_classification_random_seed"):
-            torch.manual_seed(5465456876546785)
-            random.seed(5465456876546785)
+        # Create objects for the corrupted dataset and the corresponding labels
+        corrupted = positive_triples.repeat(1, 2).view(-1, 3)
+        labels = torch.as_tensor([1, 0] * len(positive_triples))
 
         # Random decision if sample subject(sample=nonzero) or object(sample=zero)
-        sample = torch.randint(0, 2, (1, len(dataset))).to(self.device)
+        sample_subject = torch.randint(2, (len(positive_triples),)).type(torch.bool)
 
         # Sample subjects from subjects which appeared in the dataset
-        corrupted[1::2][:, 0][sample.nonzero()[:, 1]] = torch.as_tensor(
-            random.choice(list(map(int, list(map(int, dataset[:, 0].unique()))))),
-            dtype=torch.int32,
-        ).to(self.device)
+        corrupted[1::2][:, S][sample_subject] = self.uniform_sampler.sample(
+            positive_triples, 0, 1
+        )
 
         # Sample objects from objects which appeared in the dataset
-        corrupted[1::2][:, 2][(sample == 0).nonzero()[:, 1]] = torch.as_tensor(
-            random.choice(list(map(int, list(map(int, dataset[:, 2].unique()))))),
-            dtype=torch.int32,
-        ).to(self.device)
+        corrupted[1::2][:, O][(sample_subject == False)] = self.uniform_sampler.sample(
+            positive_triples, 0, 1
+        )
 
         # Save the labels per relation, since this will be needed frequently later on
         p = corrupted[:, 1]
