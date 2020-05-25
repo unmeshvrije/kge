@@ -64,8 +64,8 @@ class EvaluationJob(Job):
         #  of EvaluationAjobs, such that users can configure combinations of
         #  EvalJobs themselves. Then this can be removed.
         #  See https://github.com/uma-pi1/kge/issues/102
-        if not isinstance(self, EvalTrainingLossJob):
-            self.eval_train_loss_job = EvalTrainingLossJob(
+        if not isinstance(self, TrainingLossEvaluationJob):
+            self.eval_train_loss_job = TrainingLossEvaluationJob(
                 config, dataset, parent_job=self, model=model
             )
             self.eval_train_loss_job.verbose = False
@@ -93,7 +93,7 @@ class EvaluationJob(Job):
                 config, dataset, parent_job=parent_job, model=model
             )
         elif config.get("eval.type") == "training_loss":
-            return EvalTrainingLossJob(
+            return TrainingLossEvaluationJob(
                 config, dataset, parent_job=parent_job, model=model
             )
         else:
@@ -166,7 +166,7 @@ class EvaluationJob(Job):
         )
 
 
-class EvalTrainingLossJob(EvaluationJob):
+class TrainingLossEvaluationJob(EvaluationJob):
     """ Entity ranking evaluation protocol """
 
     def __init__(self, config: Config, dataset: Dataset, parent_job, model):
@@ -175,13 +175,14 @@ class EvalTrainingLossJob(EvaluationJob):
 
         train_job_on_eval_split_config = config.clone()
         train_job_on_eval_split_config.set("train.split", self.eval_split)
+        train_job_on_eval_split_config.set("negative_sampling.filtering.split", self.config.get("train.split"))
         self._train_job = TrainingJob.create(
             config=train_job_on_eval_split_config, parent_job=self, dataset=dataset
         )
 
         self._train_job_verbose = False
 
-        if self.__class__ == EvalTrainingLossJob:
+        if self.__class__ == TrainingLossEvaluationJob:
             for f in Job.job_created_hooks:
                 f(self)
 
