@@ -5,7 +5,7 @@ import random
 import json
 import sys
 import pickle
-
+from tqdm import tqdm
 # download link for this checkpoint given under results above
 model = kge.model.KgeModel.load_from_checkpoint('./local/fb15k-237-complex.pt')
 
@@ -47,18 +47,33 @@ valid_file = "/home/uji300/OpenKE/benchmarks/fb15k237/valid2id.txt"
 read_file_collect_triples(train_file)
 read_file_collect_triples(valid_file)
 
-
-heads = []
-tails = []
-rels  = []
 with open(test_file, "r") as fin:
     records = json.loads(fin.read())
 
 #query_string = open("test-queries-string.log", "w")
+heads_for_unique_tail_queries = []
+rels_for_unique_tail_queries  = []
+tails_for_unique_head_queries = []
+rels_for_unique_head_queries  = []
+
+unique_pairs_hr = set()
+unique_pairs_rt = set()
 for r in records:
-    heads.append(r['head'])
-    tails.append(r['tail'])
-    rels.append(r['rel'])
+    head = r['head']
+    tail = r['tail']
+    rel  = r['rel']
+    if (head, rel) not in unique_pairs_hr:
+        unique_pairs_hr.add((head, rel))
+        heads_for_unique_tail_queries.append(head)
+        rels_for_unique_tail_queries.append(rel)
+    if (tail, rel) not in unique_pairs_rt:
+        unique_pairs_rt.add((tail,rel))
+        tails_for_unique_head_queries.append(tail)
+        rels_for_unique_head_queries.append(rel)
+
+    #heads.append(r['head'])
+    #tails.append(r['tail'])
+    #rels.append(r['rel'])
     #h_str = model.dataset.entity_strings(r['head'])
     #t_str = model.dataset.entity_strings(r['tail'])
     #r_str = model.dataset.relation_strings(r['rel'])
@@ -77,23 +92,19 @@ print(model.dataset.entity_strings(s[0]), model.dataset.relation_strings(p[0]), 
 print(model.dataset.entity_strings(s[1]), model.dataset.relation_strings(p[1]), "=> ", model.dataset.entity_strings(o[1]))
 
 '''
-s = torch.Tensor(heads).long()             # subject indexes
-p = torch.Tensor(rels).long()             # relation indexes
+topk = 10
+s = torch.Tensor(heads_for_unique_tail_queries).long()             # subject indexes
+p = torch.Tensor(rels_for_unique_tail_queries).long()             # relation indexes
 scores = model.score_sp(s, p)                # scores of all objects for (s,p,?)
 o = torch.argsort(scores, dim=-1, descending = True)             # index of highest-scoring objects
 #o = torch.argmax(scores, dim=-1)             # index of highest-scoring objects
 
-topk = 10
-
-samples = np.arange(len(heads))
-#random.shuffle(samples)
 log = open("complex-answers-tail.log", "w")
-for index in samples:
-    h = model.dataset.entity_strings(s[index])
-    r = model.dataset.relation_strings(p[index])
+for index in tqdm(range(0, len(heads_for_unique_tail_queries))):
+    #h = model.dataset.entity_strings(s[index])
+    #r = model.dataset.relation_strings(p[index])
 
     filtered_answers = []
-
     if (s[index].item(), p[index].item()) not in tail_ans_dict.keys():
         for oi in o[index][:topk]:
             filtered_answers.append(oi.item())
@@ -106,15 +117,52 @@ for index in samples:
 
     assert(len(filtered_answers) == topk)
 
-    print(type(filtered_answers))
-    print(filtered_answers)
-    t = model.dataset.entity_strings(torch.Tensor(filtered_answers).long())
+    #t = model.dataset.entity_strings(torch.Tensor(filtered_answers).long())
     h_dict = ent_dict[s[index].item()]
     r_dict = rel_dict[p[index].item()]
-    t_dict = [ent_dict[filtered_answers[i]] for i in range(topk)]
-    print(h, ",", r , "=>", t, file = log)
-    print(h_dict, ",", r_dict, "-}", t_dict, file = log)
+    #print(h, ",", r , "=>", t, file = log)
+    for i in range(topk):
+        t_dict = ent_dict[filtered_answers[i]]
+        print(h_dict, ",", r_dict, ",", t_dict, ";", s[index].item(), ",", p[index].item(), ",", filtered_answers[i], sep='', file = log)
     print("*" * 80, file = log)
 
 log.close()
 #'''
+
+'''
+    Head predictions
+'''
+o = torch.Tensor(tails_for_unique_head_queries).long()             # object indexes
+p = torch.Tensor(rels_for_unique_head_queries).long()             # relation indexes
+scores = model.score_po(p, o)                # scores of all subjects for (?,p,o)
+s = torch.argsort(scores, dim=-1, descending = True)             # index of highest-scoring objects
+#o = torch.argmax(scores, dim=-1)             # index of highest-scoring objects
+
+log = open("complex-answers-head.log", "w")
+for index in tqdm(range(0, len(tails_for_unique_head_queries))):
+    #t = model.dataset.entity_strings(o[index])
+    #r = model.dataset.relation_strings(p[index])
+
+    filtered_answers = []
+    if (o[index].item(), p[index].item()) not in head_ans_dict.keys():
+        for si in s[index][:topk]:
+            filtered_answers.append(si.item())
+    else:
+        for si in s[index]:
+            if si.item() not in head_ans_dict[(o[index].item(),p[index].item())]:
+                filtered_answers.append(si.item())
+                if len(filtered_answers) == topk:
+                    break
+
+    assert(len(filtered_answers) == topk)
+
+    #h = model.dataset.entity_strings(torch.Tensor(filtered_answers).long())
+    t_dict = ent_dict[o[index].item()]
+    r_dict = rel_dict[p[index].item()]
+    #print(h, ",", r , "=>", t, file = log)
+    for i in range(topk):
+        h_dict = ent_dict[filtered_answers[i]]
+        print(h_dict, ",", r_dict, ",", t_dict, ";", filtered_answers[i], ",", p[index].item(), ",", o[index].item(), sep='', file = log)
+    print("*" * 80, file = log)
+
+log.close()
